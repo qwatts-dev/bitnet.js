@@ -1,0 +1,28 @@
+{
+  "name": "bitnet-webgpu-poc",
+  "version": "1.0.0",
+  "description": "An experimental proof-of-concept aimed at running 1-bit AI models (like Microsoft's BitNet b1.58) natively in JavaScript using WebGPU.",
+  "main": "bitnet-kernel.js",
+  "scripts": {
+    "start": "node --experimental-webgpu bitnet-kernel.js",
+    "test": "node --experimental-webgpu bitnet-kernel.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qwatts-dev/bitnet-webgpu-poc.git"
+  },
+  "keywords": [
+    "webgpu",
+    "bitnet",
+    "1-bit",
+    "ternary-weights",
+    "gpu-compute"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/qwatts-dev/bitnet-webgpu-poc/issues"
+  },
+  "homepage": "https://github.com/qwatts-dev/bitnet-webgpu-poc#readme"
+}
