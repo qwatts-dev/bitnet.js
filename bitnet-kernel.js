@@ -452,6 +452,8 @@ async function run1DKernel(device, inputData, weightData) {
 // ════════════════════════════════════════════════
 
 async function run2DKernel(device, weightMatrix, inputVec, M, K) {
+  const setupT0 = performance.now();
+
   const { packed, packedStride } = packWeightMatrix(weightMatrix, M, K);
 
   // ── Buffers ──
@@ -517,10 +519,12 @@ async function run2DKernel(device, weightMatrix, inputVec, M, K) {
     ],
   });
 
+  const setupMs = performance.now() - setupT0;
+
   // ── Dispatch: one workgroup per row ──
-  const t0      = performance.now();
-  const encoder = device.createCommandEncoder();
-  const pass    = encoder.beginComputePass();
+  const computeT0 = performance.now();
+  const encoder   = device.createCommandEncoder();
+  const pass      = encoder.beginComputePass();
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(M);
@@ -532,12 +536,12 @@ async function run2DKernel(device, weightMatrix, inputVec, M, K) {
   const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
   stagingBuf.unmap();
 
-  const gpuMs = performance.now() - t0;
+  const computeMs = performance.now() - computeT0;
 
   [inputBuf, weightBuf, resultBuf, stagingBuf, uniformBuf].forEach((b) =>
     b.destroy(),
   );
-  return { results, gpuMs, packed, packedStride };
+  return { results, setupMs, computeMs, packed, packedStride };
 }
 
 // ════════════════════════════════════════════════
@@ -665,8 +669,8 @@ async function main() {
   // TEST 2 – 2D Tiled Matrix–Vector Multiply
   // ─────────────────────────────────────────────
 
-  const M = 8;
-  const K = 256;
+  const M = 4096;
+  const K = 4096;
 
   log(`━━━ Test 2: 2D Tiled Mat-Vec Kernel (${M}×${K}, ` +
       `tile = ${TILE_K}, wg = ${WORKGROUP_SIZE}) ━━━`);
@@ -697,27 +701,36 @@ async function main() {
 
   // GPU
   const {
-    results: gpuResult2D,
-    gpuMs:   gpuMs2D,
+    results:   gpuResult2D,
+    setupMs:   setupMs2D,
+    computeMs: computeMs2D,
   } = await run2DKernel(device, weightMatrix, inputVec, M, K);
 
   // Validate
   const v2 = compareResults(cpuResult2D, gpuResult2D, 0.1);
 
-  log(`  CPU time : ${cpuMs2D.toFixed(3)} ms`);
-  log(`  GPU time : ${gpuMs2D.toFixed(3)} ms  (incl. pipeline + readback)`);
-  log(`  Max |err|: ${v2.maxErr.toExponential(2)}  (at row ${v2.idx})`);
+  log(`  CPU time     : ${cpuMs2D.toFixed(3)} ms`);
+  log(`  GPU setup    : ${setupMs2D.toFixed(3)} ms  (buffers + pipeline compile)`);
+  log(`  GPU compute  : ${computeMs2D.toFixed(3)} ms  (submit + readback only)`);
+  log(`  Max |err|    : ${v2.maxErr.toExponential(2)}  (at row ${v2.idx})`);
   log("");
 
+  log(`  ⚡ Compute race: CPU ${cpuMs2D.toFixed(3)} ms  vs  GPU ${computeMs2D.toFixed(3)} ms`);
+  const speedup = cpuMs2D / computeMs2D;
+  log(`  → GPU is ${speedup.toFixed(1)}× ${speedup >= 1 ? "faster" : "slower"} than CPU (compute only)`, "info");
+  log("");
+
+  const PREVIEW_ROWS = Math.min(16, M);
   log("  ┌───────┬──────────────┬──────────────┬──────────────┐");
   log("  │  Row  │     CPU      │     GPU      │    |Δ|       │");
   log("  ├───────┼──────────────┼──────────────┼──────────────┤");
-  for (let i = 0; i < M; i++) {
+  for (let i = 0; i < PREVIEW_ROWS; i++) {
     const c   = cpuResult2D[i].toFixed(4).padStart(12);
     const g   = gpuResult2D[i].toFixed(4).padStart(12);
     const d   = Math.abs(cpuResult2D[i] - gpuResult2D[i]).toExponential(2).padStart(12);
     log(`  │ ${String(i).padStart(5)} │ ${c} │ ${g} │ ${d} │`);
   }
+  if (M > PREVIEW_ROWS) log("  │  ...  │     ...      │     ...      │     ...      │");
   log("  └───────┴──────────────┴──────────────┴──────────────┘");
   log("");
 

@@ -16,7 +16,9 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Branchless ternary arithmetic (no if/else, no select)
 - [x] 2D tiled mat-vec kernel using `var<workgroup>`
 - [x] Automated CPU vs GPU validation (PASS/FAIL)
-- [ ] Performance benchmarking against `f32` multiply
+- [x] Stress-tested at 4096×4096 (~16.7M parameters)
+- [x] Isolated GPU setup vs compute timing
+- [ ] Load real weights from Hugging Face
 
 ## How It Works
 
@@ -71,24 +73,25 @@ and a reduction across the workgroup produces the final dot product.
    
    Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results.
 
-## Latest Test Results (iPad)
+## Latest Benchmark Results
 
-The current harness runs two tests: a 1D element-wise kernel and a 2D
-matrix-vector multiply with tiling. Example results from an iPad run:
+2D tiled mat-vec at **4096×4096** (~16.7M ternary parameters), bit-packed to 4 MB (93.8% smaller than unpacked).
 
-```
-Test 1 (1D): N = 1024
-- Max |err|: 0.00e+0
-- CPU time : 0.000 ms
-- GPU time : 208.000 ms (includes pipeline + readback)
+| Metric | iPad Air M3 | MacBook M2 Max |
+|--------|-------------|----------------|
+| CPU mat-vec | 71 ms | 94 ms |
+| GPU setup | 73 ms | 98.2 ms |
+| GPU compute | **7 ms** | **4.1 ms** |
+| Speedup | **10.1×** | **22.9×** |
+| Max error | 2.08e-3 | 2.08e-3 |
 
-Test 2 (2D): 8 x 256
-- Max |err|: 2.29e-5
-- CPU time : 0.000 ms
-- GPU time : 36.000 ms (includes pipeline + readback)
+**Key takeaways:**
 
-Overall: ALL TESTS PASSED
-```
+- **The timing split paid off.** Setup cost (buffers + pipeline compile) dominates total GPU time at ~73–98 ms, but the raw compute is only 4–7 ms for 16.7M ternary parameters. Without the split, the GPU would have looked slower than CPU.
+- **M2 Max is ~1.7× faster on compute** than M3 (4.1 ms vs 7 ms), which tracks with its 30-core vs 10-core GPU advantage and higher memory bandwidth (400 GB/s vs ~150 GB/s).
+- **M3 has faster CPU single-thread** (71 ms vs 94 ms), consistent with its newer core architecture despite fewer cores.
+- **Numerical precision is identical** across both devices — max error of 2.08e-3 at the same row (496), confirming deterministic f32 accumulation behavior across Apple GPU generations.
+- **Setup cost is a one-time expense** in a real inference pipeline — the pipeline and buffers would be reused across tokens, so the 4–7 ms compute time is the number that matters for throughput.
 
 ## Project Structure
 
