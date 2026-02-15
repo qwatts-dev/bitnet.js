@@ -8,11 +8,14 @@ Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which 
 By replacing complex multiplication with simple addition and subtraction directly on the GPU, we aim to drastically reduce memory bandwidth and make running massive Large Language Models in the browser a reality.
 
 ## Current Status
-- [x] Initial Repository Setup
+- [x] Initial repository setup
 - [x] WebGPU environment configuration
-- [x] WGSL Compute Shader for ternary math
+- [x] WGSL compute shader for ternary math
 - [x] Browser-based execution via local web server
-- [ ] Extended matrix–vector operations
+- [x] Bit-packed weights (16 ternary values per u32)
+- [x] Branchless ternary arithmetic (no if/else, no select)
+- [x] 2D tiled mat-vec kernel using `var<workgroup>`
+- [x] Automated CPU vs GPU validation (PASS/FAIL)
 - [ ] Performance benchmarking against `f32` multiply
 
 ## How It Works
@@ -26,6 +29,30 @@ The WGSL compute shader receives an input vector and a ternary weight vector (`{
 | `0`    | Output zero (skip) | Nothing |
 
 This completely eliminates floating-point multiplication, which is the core insight behind BitNet b1.58.
+
+### Bit-packing (2 bits per weight)
+
+Weights are packed into `u32` buffers to reduce memory bandwidth:
+
+| 2-bit code | Weight | Meaning |
+|------------|--------|---------|
+| `00`       | 0      | skip    |
+| `01`       | +1     | add     |
+| `10`       | -1     | subtract |
+
+The WGSL kernel unpacks 16 weights per `u32` and applies a branchless
+bitmask to include or exclude the input value.
+
+### Branchless ternary math
+
+Instead of `if/else`, the kernel uses full-width bitmasks to select
+`+input`, `-input`, or `0` without warp divergence.
+
+### 2D tiled mat-vec kernel
+
+For matrix-vector multiplication, input tiles are cached in
+`var<workgroup>` shared memory. Each workgroup computes one output row,
+and a reduction across the workgroup produces the final dot product.
 
 ## Quick Start
 
@@ -43,6 +70,25 @@ This completely eliminates floating-point multiplication, which is the core insi
 3. **Open in a WebGPU-capable browser** (Chrome 113+, Edge 113+, Safari 18+)
    
    Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results.
+
+## Latest Test Results (iPad)
+
+The current harness runs two tests: a 1D element-wise kernel and a 2D
+matrix-vector multiply with tiling. Example results from an iPad run:
+
+```
+Test 1 (1D): N = 1024
+- Max |err|: 0.00e+0
+- CPU time : 0.000 ms
+- GPU time : 208.000 ms (includes pipeline + readback)
+
+Test 2 (2D): 8 x 256
+- Max |err|: 2.29e-5
+- CPU time : 0.000 ms
+- GPU time : 36.000 ms (includes pipeline + readback)
+
+Overall: ALL TESTS PASSED
+```
 
 ## Project Structure
 
