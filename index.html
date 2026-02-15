@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>BitNet 1.58-bit WebGPU Kernel – PoC</title>
+  <title>BitNet 1.58-bit WebGPU Kernel – Optimised PoC</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -22,8 +22,10 @@
       padding: 1rem 1.25rem;
       white-space: pre-wrap;
       line-height: 1.6;
-      font-size: 0.9rem;
-      max-width: 700px;
+      font-size: 0.85rem;
+      max-width: 900px;
+      max-height: 85vh;
+      overflow-y: auto;
     }
     .pass  { color: #3fb950; }
     .fail  { color: #f85149; }
@@ -33,7 +35,7 @@
 </head>
 <body>
   <h1>BitNet 1.58-bit WebGPU Kernel</h1>
-  <h2>Ternary-weight compute shader proof-of-concept</h2>
+  <h2>Bit-Packed · Branchless · Tiled — with automated CPU↔GPU validation</h2>
   <div id="output">Initialising WebGPU…</div>
   <script type="module" src="bitnet-kernel.js"></script>
 </body>
