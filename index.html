@@ -31,11 +31,69 @@
     .fail  { color: #f85149; }
     .info  { color: #8b949e; }
     .bold  { font-weight: bold; }
+
+    /* ── Interactive panel ── */
+    #interactive {
+      max-width: 900px;
+      margin-bottom: 1.25rem;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    #user-text {
+      flex: 1;
+      padding: 0.5rem 0.75rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+      background: #161b22;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      outline: none;
+    }
+    #user-text:focus { border-color: #58a6ff; }
+    #compute-btn {
+      padding: 0.5rem 1rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #fff;
+      background: #238636;
+      border: 1px solid #2ea043;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #compute-btn:hover { background: #2ea043; }
+    #compute-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #interactive-output {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      font-size: 0.85rem;
+      max-width: 900px;
+      margin-bottom: 1.25rem;
+      display: none;            /* shown after first compute */
+    }
   </style>
 </head>
 <body>
   <h1>BitNet 1.58-bit WebGPU Kernel</h1>
   <h2>Bit-Packed · Branchless · Tiled — with automated CPU↔GPU validation</h2>
+
+  <!-- Interactive compute panel -->
+  <div id="interactive">
+    <input id="user-text" type="text" placeholder="Type a word or sentence…" disabled />
+    <button id="compute-btn" disabled>Compute</button>
+  </div>
+  <div id="interactive-output"></div>
+
+  <!-- Automated test log -->
   <div id="output">Initialising WebGPU…</div>
   <script type="module" src="bitnet-kernel.js"></script>
 </body>

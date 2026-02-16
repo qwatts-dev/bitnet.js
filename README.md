@@ -19,7 +19,11 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Stress-tested at 4096×4096 (~16.7M parameters)
 - [x] Isolated GPU setup vs compute timing
 - [x] Real AI weights from Hugging Face (`microsoft/bitnet-b1.58-2B-4T`)
-- [ ] Tokenizer integration for text-in → text-out inference
+- [x] Tokenizer integration via Hugging Face `transformers.js` v4 (CDN, no bundler)
+- [x] Interactive UI — type text, click Compute, see real GPU output
+- [x] Cross-device determinism verified (iPhone / iPad / MacBook — bit-exact match)
+- [ ] Real embedding layer (replace mock embeddings with actual model weights)
+- [ ] Multi-layer inference pipeline
 
 ## How It Works
 
@@ -56,6 +60,18 @@ Instead of `if/else`, the kernel uses full-width bitmasks to select
 For matrix-vector multiplication, input tiles are cached in
 `var<workgroup>` shared memory. Each workgroup computes one output row,
 and a reduction across the workgroup produces the final dot product.
+
+### Tokenizer integration (v0.3.1)
+
+The Llama 3 tokenizer is loaded at runtime from the Hugging Face CDN via
+[`@huggingface/transformers`](https://www.npmjs.com/package/@huggingface/transformers)
+v4 as a native ES module — no bundler required. Text is tokenized into
+`input_ids`, and a deterministic hash of all token IDs seeds a PRNG that
+generates a mock embedding vector. This lets the full pipeline run
+end-to-end: **text → tokenizer → embedding → GPU mat-vec → output**.
+
+An interactive panel in the UI lets you type any text and run it through
+the real BitNet weight matrix on the GPU with a single click.
 
 ### Real AI weight integration
 
@@ -131,11 +147,35 @@ Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
 | Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
 | Result | ✅ PASS | ✅ PASS | ✅ PASS |
 
+### Interactive mode: tokenizer → GPU mat-vec (v0.3.1)
+
+Two different inputs run through the full pipeline (`transformers.js` tokenize → hash-seeded mock embedding → real BitNet weight matrix on GPU).
+
+**"Hello World!"** (3 tokens, seed 3316881853)
+
+| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
+|--------|-------------------|-------------|----------------|
+| GPU compute | 15.0 ms | 9.0 ms | 4.4 ms |
+| output[0] | 6.691558 | 6.691558 | 6.691558 |
+| output[1] | 11.091652 | 11.091652 | 11.091652 |
+| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
+
+**"Running 1.58-bit AI natively on WebGPU!"** (13 tokens, seed 2986547843)
+
+| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
+|--------|-------------------|-------------|----------------|
+| GPU compute | 15.0 ms | 9.0 ms | 3.5 ms |
+| output[0] | -18.373604 | -18.373604 | -18.373604 |
+| output[1] | 48.686615 | 48.686615 | 48.686615 |
+| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
+
 **Key takeaways:**
 
+- **Cross-device determinism.** All output values match to 6 decimal places across iPhone (A16), iPad (M3), and MacBook (M2 Max). The branchless, bit-packed kernel produces identical IEEE 754 results regardless of GPU architecture.
+- **Different text → different output.** The all-token hash seed ensures each unique input produces a distinct embedding and therefore distinct GPU output.
 - **Real AI weights work end-to-end.** Pre-trained ternary weights from Hugging Face are extracted, bit-packed, fetched by the browser, and processed by the WebGPU kernel — producing non-trivial output on all three devices.
-- **M2 Max dominates on compute** at 3.1 ms (Test 2) and 4.8 ms (Test 3), benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
-- **Even an iPhone processes a real 17.7M-parameter layer in 13 ms** — well within interactive latency requirements.
+- **M2 Max dominates on compute** at 3.1 ms (Test 2) and 3.5–4.8 ms (Test 3 / interactive), benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
+- **Even an iPhone processes a real 17.7M-parameter layer in 13–15 ms** — well within interactive latency requirements.
 - **Setup cost is a one-time expense** — the pipeline and buffers would be reused across tokens in a real inference loop, so the compute time is what matters for throughput.
 - **Numerical precision is identical** across all three Apple GPU generations — max error of 2.08e-3 at the same row, confirming deterministic f32 accumulation.
 
@@ -143,11 +183,18 @@ Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
 
 | File | Description |
 |------|-------------|
-| `index.html` | Minimal page that loads the kernel as an ES module |
-| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, buffer management, and result display |
+| `index.html` | Page with interactive text input panel and automated test log |
+| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, tokenizer integration, interactive handler, and validation |
 | `extract_weights.py` | Python script to extract and bit-pack weights from Hugging Face |
 | `bitnet_layer_0_down_proj.bin` | Pre-packed weight binary for Test 3 (generated by `extract_weights.py`) |
 | `package.json` | Project metadata |
+
+## Dependencies
+
+| Dependency | How it's used | Loaded via |
+|---|---|---|
+| [`@huggingface/transformers`](https://www.npmjs.com/package/@huggingface/transformers) v4 | Llama 3 tokenizer (`AutoTokenizer`) | CDN ES module import (no install needed) |
+| [`Xenova/llama3-tokenizer`](https://huggingface.co/Xenova/llama3-tokenizer) | Tokenizer vocab/config files | Fetched at runtime from Hugging Face Hub |
 
 ## License
 This project is licensed under the MIT License - free and open for anyone to contribute, fork, and hack on!

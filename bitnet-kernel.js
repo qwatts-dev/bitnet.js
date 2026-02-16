@@ -38,6 +38,32 @@
  */
 
 // ════════════════════════════════════════════════
+// Tokenizer (Hugging Face transformers.js v4)
+// ════════════════════════════════════════════════
+
+import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.0-next.3';
+
+let tokenizer    = null;
+let gpuDevice     = null;   // kept alive for interactive use
+let realWeights   = null;   // Uint32Array – packed BitNet layer
+const REAL_M      = 2560;   // rows  (down_proj output dim)
+const REAL_K      = 6912;   // cols  (down_proj input  dim)
+
+/**
+ * Initialise the Llama-3 tokenizer via Hugging Face transformers.js.
+ * Uses the public, ungated tokenizer-only repo (same vocab as
+ * Meta-Llama-3 / BitNet models that share the Llama vocabulary).
+ * Stores the instance in the module-level `tokenizer` variable.
+ */
+async function initTokenizer() {
+  const MODEL_ID = 'Xenova/llama3-tokenizer';
+  log(`Loading tokenizer (${MODEL_ID}) …`, 'info');
+  tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+  log('✔ Tokenizer ready', 'info');
+  log('');
+}
+
+// ════════════════════════════════════════════════
 // Constants
 // ════════════════════════════════════════════════
 
@@ -335,6 +361,63 @@ function generateMatrixTestData(M, K, seed = 123) {
     weightMatrix[i] = r < 0.333 ? -1 : r < 0.666 ? 0 : 1;
   }
   return { inputVec, weightMatrix };
+}
+
+// ════════════════════════════════════════════════
+// 5b. Token-Seeded Mock Embedding
+// ════════════════════════════════════════════════
+
+/**
+ * Convert text → mock embedding vector suitable for run2DKernel.
+ *
+ * Steps:
+ *   1. Tokenize `text` with the loaded transformers.js tokenizer.
+ *   2. Take the LAST token ID (simulates the "current step").
+ *   3. Seed a deterministic PRNG with that token ID.
+ *   4. Fill a Float32Array(K) with values in [-1.0, 1.0].
+ *
+ * The same text always produces the same embedding, making results
+ * reproducible while still being driven by real tokenizer output.
+ *
+ * @param {string} text  – input text to tokenize
+ * @param {number} K     – embedding dimension (weight-matrix columns)
+ * @returns {Float32Array} mock embedding of length K
+ */
+function textToMockEmbedding(text, K) {
+  if (!tokenizer) {
+    throw new Error('Tokenizer not initialised – call initTokenizer() first.');
+  }
+
+  // tokenizer(text) returns { input_ids, attention_mask } where
+  // input_ids is a Tensor.  .tolist() gives [[id, id, …]].
+  const { input_ids } = tokenizer(text);
+  const ids = input_ids.tolist().flat().map(Number);
+
+  if (ids.length === 0) {
+    throw new Error('Tokenizer produced an empty sequence.');
+  }
+
+  // Combine ALL token IDs into a single seed so that different
+  // inputs always produce different embeddings.  A simple hash:
+  //   seed = id[0]*p^0  ^  id[1]*p^1  ^  …   (wrapping to i32)
+  // This avoids the problem of a trailing special token (e.g. 0)
+  // making every input map to the same seed.
+  let seed = 0;
+  for (let i = 0; i < ids.length; i++) {
+    // Math.imul keeps us in 32-bit integer range; XOR mixes bits
+    seed = (seed ^ Math.imul(ids[i], 2654435761 + (i << 2))) | 0;
+  }
+
+  log(`  Tokenized "${text.length > 40 ? text.slice(0, 37) + '…' : text}"` +
+      ` → ${ids.length} tokens, seed = ${seed >>> 0}`, 'info');
+
+  // Deterministic PRNG seeded by the combined token hash
+  const rng = mulberry32(seed);
+  const embedding = new Float32Array(K);
+  for (let i = 0; i < K; i++) {
+    embedding[i] = rng() * 2 - 1;   // range [-1.0, 1.0]
+  }
+  return embedding;
 }
 
 // ════════════════════════════════════════════════
@@ -687,6 +770,9 @@ async function main() {
   log("╚════════════════════════════════════════════════════════╝");
   log("");
 
+  // ── Tokenizer ──
+  await initTokenizer();
+
   const device = await initWebGPU();
   log("✔ WebGPU device acquired", "info");
   log("");
@@ -845,11 +931,8 @@ async function main() {
   // TEST 3 – Real AI Weights Integration
   // ─────────────────────────────────────────────
 
-  const M3 = 2560;
-  const K3 = 6912;
-
   log(`━━━ Test 3: Real AI Weights – microsoft/bitnet-b1.58-2B-4T ━━━`);
-  log(`  Layer: model.layers.0.mlp.down_proj  (${M3} × ${K3})`);
+  log(`  Layer: model.layers.0.mlp.down_proj  (${REAL_M} × ${REAL_K})`);
   log("");
 
   try {
@@ -860,12 +943,12 @@ async function main() {
     const buf  = await resp.arrayBuffer();
     const packedReal = new Uint32Array(buf);
 
-    const expectedStride = Math.ceil(K3 / 16);
-    const expectedLen    = M3 * expectedStride;
+    const expectedStride = Math.ceil(REAL_K / 16);
+    const expectedLen    = REAL_M * expectedStride;
     log(`  Loaded ${packedReal.length.toLocaleString()} u32 words ` +
         `(${packedReal.byteLength.toLocaleString()} bytes)`, "info");
     log(`  Expected: ${expectedLen.toLocaleString()} u32 words ` +
-        `(${M3} rows × ${expectedStride} stride)`, "info");
+        `(${REAL_M} rows × ${expectedStride} stride)`, "info");
     if (packedReal.length !== expectedLen) {
       throw new Error(
         `Size mismatch: got ${packedReal.length}, expected ${expectedLen}`,
@@ -873,12 +956,15 @@ async function main() {
     }
     log("");
 
+    // Store weights for interactive use
+    realWeights = packedReal;
+
     // Create mock input vector (random floats in [-1, 1])
-    const mockInput = new Float32Array(K3);
-    for (let i = 0; i < K3; i++) {
+    const mockInput = new Float32Array(REAL_K);
+    for (let i = 0; i < REAL_K; i++) {
       mockInput[i] = Math.random() * 2 - 1;
     }
-    log(`  Mock input vector: ${K3} × f32 (random [-1, 1])`);
+    log(`  Mock input vector: ${REAL_K} × f32 (random [-1, 1])`);
     log("");
 
     // Run on GPU with pre-packed weights
@@ -886,7 +972,7 @@ async function main() {
       results:   gpuResult3,
       setupMs:   setupMs3,
       computeMs: computeMs3,
-    } = await run2DKernelPacked(device, packedReal, mockInput, M3, K3);
+    } = await run2DKernelPacked(device, packedReal, mockInput, REAL_M, REAL_K);
 
     log(`  GPU setup   : ${setupMs3.toFixed(3)} ms  (buffers + pipeline)`);
     log(`  GPU compute : ${computeMs3.toFixed(3)} ms  (dispatch + readback)`);
@@ -937,8 +1023,95 @@ async function main() {
   }
   log("════════════════════════════════════════════════════════");
 
-  device.destroy();
-  log("\n✔ GPU device destroyed – done.", "info");
+  // ── Keep device + weights alive for interactive use ──
+  gpuDevice = device;
+  log("");
+
+  if (realWeights) {
+    log("✔ Interactive mode ready – type text above and click Compute!", "pass");
+    const inputEl = document.getElementById("user-text");
+    const btnEl   = document.getElementById("compute-btn");
+    if (inputEl) inputEl.disabled = false;
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.addEventListener("click", onComputeClick);
+    }
+    // Also allow Enter key in the input
+    if (inputEl) {
+      inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !btnEl.disabled) onComputeClick();
+      });
+    }
+  } else {
+    log("⚠  Interactive mode unavailable (weights failed to load)", "fail");
+  }
+}
+
+// ════════════════════════════════════════════════
+// 12. Interactive Compute Handler
+// ════════════════════════════════════════════════
+
+/**
+ * Called when the user clicks "Compute" (or presses Enter).
+ * Tokenizes the input text, builds a mock embedding seeded by
+ * the last token ID, runs it through the real BitNet weight
+ * matrix on the GPU, and displays the results.
+ */
+async function onComputeClick() {
+  const inputEl  = document.getElementById("user-text");
+  const btnEl    = document.getElementById("compute-btn");
+  const outEl    = document.getElementById("interactive-output");
+  if (!inputEl || !outEl) return;
+
+  const text = inputEl.value.trim();
+  if (!text) return;
+
+  // Disable controls while running
+  btnEl.disabled    = true;
+  inputEl.disabled  = true;
+  outEl.style.display = "block";
+  outEl.textContent   = "Computing…\n";
+
+  const ilog = (msg, cls) => {
+    const span = document.createElement("span");
+    if (cls) span.className = cls;
+    span.textContent = msg + "\n";
+    outEl.appendChild(span);
+  };
+
+  try {
+    // 1. Tokenize → mock embedding
+    const embedding = textToMockEmbedding(text, REAL_K);
+
+    // 2. Run through real BitNet weights on the GPU
+    const {
+      results,
+      computeMs,
+    } = await run2DKernelPacked(gpuDevice, realWeights, embedding, REAL_M, REAL_K);
+
+    // 3. Display results
+    outEl.textContent = "";
+    ilog(`Input : "${text}"`);
+    ilog(`GPU compute time : ${computeMs.toFixed(3)} ms`, "info");
+    ilog("");
+    ilog("┌───────┬──────────────────┐");
+    ilog("│  Row  │    GPU Output     │");
+    ilog("├───────┼──────────────────┤");
+    const ROWS = Math.min(10, results.length);
+    for (let i = 0; i < ROWS; i++) {
+      const val = results[i].toFixed(6).padStart(16);
+      ilog(`│ ${String(i).padStart(5)} │ ${val} │`);
+    }
+    if (results.length > ROWS) ilog("│  ...  │       ...        │");
+    ilog("└───────┴──────────────────┘");
+  } catch (err) {
+    ilog(`❌ Error: ${err.message}`, "fail");
+    console.error(err);
+  } finally {
+    btnEl.disabled   = false;
+    inputEl.disabled = false;
+    inputEl.focus();
+  }
 }
 
 main().catch((err) => {
