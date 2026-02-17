@@ -38,10 +38,10 @@
  */
 
 // ════════════════════════════════════════════════
-// Tokenizer (Hugging Face transformers.js v4)
+// Tokenizer (@huggingface/tokenizers – standalone, ~8.3 kB)
 // ════════════════════════════════════════════════
 
-import { AutoTokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.0-next.3';
+import { Tokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/tokenizers';
 
 let tokenizer    = null;
 let gpuDevice     = null;   // kept alive for interactive use
@@ -50,15 +50,35 @@ const REAL_M      = 2560;   // rows  (down_proj output dim)
 const REAL_K      = 6912;   // cols  (down_proj input  dim)
 
 /**
- * Initialise the Llama-3 tokenizer via Hugging Face transformers.js.
- * Uses the public, ungated tokenizer-only repo (same vocab as
- * Meta-Llama-3 / BitNet models that share the Llama vocabulary).
- * Stores the instance in the module-level `tokenizer` variable.
+ * Fetch a URL using the browser Cache API so repeated loads are instant.
+ * On cache miss: fetches, stores a clone in the cache, returns parsed JSON.
+ * On cache hit: returns the cached response as parsed JSON.
+ */
+async function fetchWithCache(url) {
+  const cache = await caches.open('hf-tokenizer-cache');
+  const cached = await cache.match(url);
+  if (cached) return cached.json();
+  const res = await fetch(url);
+  await cache.put(url, res.clone());
+  return res.json();
+}
+
+/**
+ * Initialise the Llama-3 tokenizer via the standalone
+ * @huggingface/tokenizers package (~8.3 kB).
+ * Downloads tokenizer.json + tokenizer_config.json from the
+ * public Xenova/llama3-tokenizer repo on Hugging Face Hub.
  */
 async function initTokenizer() {
-  const MODEL_ID = 'Xenova/llama3-tokenizer';
-  log(`Loading tokenizer (${MODEL_ID}) …`, 'info');
-  tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID);
+  const BASE = 'https://huggingface.co/Xenova/llama3-tokenizer/resolve/main';
+  log('Loading tokenizer (Xenova/llama3-tokenizer) …', 'info');
+
+  const [tokenizerJson, tokenizerConfig] = await Promise.all([
+    fetchWithCache(`${BASE}/tokenizer.json`),
+    fetchWithCache(`${BASE}/tokenizer_config.json`),
+  ]);
+
+  tokenizer = new Tokenizer(tokenizerJson, tokenizerConfig);
   log('✔ Tokenizer ready', 'info');
   log('');
 }
@@ -388,10 +408,10 @@ function textToMockEmbedding(text, K) {
     throw new Error('Tokenizer not initialised – call initTokenizer() first.');
   }
 
-  // tokenizer(text) returns { input_ids, attention_mask } where
-  // input_ids is a Tensor.  .tolist() gives [[id, id, …]].
-  const { input_ids } = tokenizer(text);
-  const ids = input_ids.tolist().flat().map(Number);
+  // Standalone @huggingface/tokenizers: encode() returns
+  // { ids: number[], tokens: string[], attention_mask: number[] }.
+  const encoded = tokenizer.encode(text);
+  const ids = encoded.ids;
 
   if (ids.length === 0) {
     throw new Error('Tokenizer produced an empty sequence.');

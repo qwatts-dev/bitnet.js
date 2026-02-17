@@ -22,6 +22,8 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Tokenizer integration via Hugging Face `transformers.js` v4 (CDN, no bundler)
 - [x] Interactive UI — type text, click Compute, see real GPU output
 - [x] Cross-device determinism verified (iPhone / iPad / MacBook — bit-exact match)
+- [x] Migrated to standalone [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) (~8.3 kB gzipped)
+- [x] Browser Cache API (`fetchWithCache`) for instant repeat tokenizer loads
 - [ ] Real embedding layer (replace mock embeddings with actual model weights)
 - [ ] Multi-layer inference pipeline
 
@@ -61,14 +63,21 @@ For matrix-vector multiplication, input tiles are cached in
 `var<workgroup>` shared memory. Each workgroup computes one output row,
 and a reduction across the workgroup produces the final dot product.
 
-### Tokenizer integration (v0.3.1)
+### Tokenizer integration (v0.3.2)
 
-The Llama 3 tokenizer is loaded at runtime from the Hugging Face CDN via
-[`@huggingface/transformers`](https://www.npmjs.com/package/@huggingface/transformers)
-v4 as a native ES module — no bundler required. Text is tokenized into
-`input_ids`, and a deterministic hash of all token IDs seeds a PRNG that
-generates a mock embedding vector. This lets the full pipeline run
-end-to-end: **text → tokenizer → embedding → GPU mat-vec → output**.
+The Llama 3 tokenizer is loaded at runtime using the standalone
+[`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers)
+package (~8.3 kB gzipped) via CDN as a native ES module — no bundler
+required. This replaces the full `@huggingface/transformers` library
+(~1.2 MB) with a purpose-built tokenizer that is **~150× smaller**.
+
+Tokenizer config files (`tokenizer.json` and `tokenizer_config.json`)
+are fetched from the Hugging Face Hub and cached using the browser's
+standard Cache API (`caches.open('hf-tokenizer-cache')`), making repeat
+page loads instant. Text is encoded via `tokenizer.encode(text)`, and a
+deterministic hash of all token IDs seeds a PRNG that generates a mock
+embedding vector. This lets the full pipeline run end-to-end:
+**text → tokenizer → embedding → GPU mat-vec → output**.
 
 An interactive panel in the UI lets you type any text and run it through
 the real BitNet weight matrix on the GPU with a single click.
@@ -147,26 +156,17 @@ Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
 | Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
 | Result | ✅ PASS | ✅ PASS | ✅ PASS |
 
-### Interactive mode: tokenizer → GPU mat-vec (v0.3.1)
+### Interactive mode: tokenizer → GPU mat-vec (v0.3.2)
 
-Two different inputs run through the full pipeline (`transformers.js` tokenize → hash-seeded mock embedding → real BitNet weight matrix on GPU).
+Input run through the full pipeline (`@huggingface/tokenizers` encode → hash-seeded mock embedding → real BitNet weight matrix on GPU).
 
-**"Hello World!"** (3 tokens, seed 3316881853)
+**"Hello"** (1 token, seed 1050862354)
 
-| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
+| Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
 |--------|-------------------|-------------|----------------|
-| GPU compute | 15.0 ms | 9.0 ms | 4.4 ms |
-| output[0] | 6.691558 | 6.691558 | 6.691558 |
-| output[1] | 11.091652 | 11.091652 | 11.091652 |
-| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
-
-**"Running 1.58-bit AI natively on WebGPU!"** (13 tokens, seed 2986547843)
-
-| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
-|--------|-------------------|-------------|----------------|
-| GPU compute | 15.0 ms | 9.0 ms | 3.5 ms |
-| output[0] | -18.373604 | -18.373604 | -18.373604 |
-| output[1] | 48.686615 | 48.686615 | 48.686615 |
+| GPU compute | 13.0 ms | 10.0 ms | 6.4 ms |
+| output[0] | -13.920891 | -13.920891 | -13.920891 |
+| output[1] | 19.375885 | 19.375885 | 19.375885 |
 | Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
 
 **Key takeaways:**
@@ -193,8 +193,8 @@ Two different inputs run through the full pipeline (`transformers.js` tokenize �
 
 | Dependency | How it's used | Loaded via |
 |---|---|---|
-| [`@huggingface/transformers`](https://www.npmjs.com/package/@huggingface/transformers) v4 | Llama 3 tokenizer (`AutoTokenizer`) | CDN ES module import (no install needed) |
-| [`Xenova/llama3-tokenizer`](https://huggingface.co/Xenova/llama3-tokenizer) | Tokenizer vocab/config files | Fetched at runtime from Hugging Face Hub |
+| [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) v0.1.1 | Llama 3 tokenizer (`Tokenizer`) — ~8.3 kB gzipped | CDN ES module import (no install needed) |
+| [`Xenova/llama3-tokenizer`](https://huggingface.co/Xenova/llama3-tokenizer) | `tokenizer.json` + `tokenizer_config.json` | Fetched at runtime from Hugging Face Hub, cached via Cache API |
 
 ## License
 This project is licensed under the MIT License - free and open for anyone to contribute, fork, and hack on!
