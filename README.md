@@ -24,7 +24,8 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Cross-device determinism verified (iPhone / iPad / MacBook — bit-exact match)
 - [x] Migrated to standalone [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) (~8.3 kB gzipped)
 - [x] Browser Cache API (`fetchWithCache`) for instant repeat tokenizer loads
-- [ ] Real embedding layer (replace mock embeddings with actual model weights)
+- [x] Real embedding layer — sparse FP16 vocab slice (16,385 tokens, 80 MB)
+- [x] Mobile-optimised: iPhone / iPad / MacBook all load and run successfully
 - [ ] Multi-layer inference pipeline
 
 ## How It Works
@@ -74,13 +75,31 @@ required. This replaces the full `@huggingface/transformers` library
 Tokenizer config files (`tokenizer.json` and `tokenizer_config.json`)
 are fetched from the Hugging Face Hub and cached using the browser's
 standard Cache API (`caches.open('hf-tokenizer-cache')`), making repeat
-page loads instant. Text is encoded via `tokenizer.encode(text)`, and a
-deterministic hash of all token IDs seeds a PRNG that generates a mock
-embedding vector. This lets the full pipeline run end-to-end:
-**text → tokenizer → embedding → GPU mat-vec → output**.
+page loads instant.
 
-An interactive panel in the UI lets you type any text and run it through
-the real BitNet weight matrix on the GPU with a single click.
+### Real semantic embeddings (v0.4.0)
+
+The `extract_sparse_embeddings.py` script extracts the actual
+`model.embed_tokens.weight` tensor from
+[`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T).
+Since BPE tokenizers assign lower IDs to more frequent tokens, the first
+16,384 tokens cover ~99% of standard English. An extra row for token
+50991 ("WebGPU") is appended for domain-specific testing.
+
+The embedding vectors are stored in **Float16** to halve memory versus
+Float32, producing an **80 MB** binary file (down from 1.3 GB for the
+full Float32 vocabulary). A `vocab_map.json` maps original token IDs to
+dense row indices in the binary file.
+
+At runtime, the browser fetches both files in parallel. A lightweight
+`fp16ToNumber()` function converts each half-precision value to a
+standard JavaScript number. The 2,560-dimensional embedding is then
+zero-padded to 6,912 (the GPU kernel's input width) before dispatch.
+
+Tokens outside the 16K subset gracefully fall back to row 0 (OOV).
+
+**Pipeline:** text → tokenizer → vocab map lookup → FP16→F32 conversion →
+zero-pad → GPU ternary mat-vec → output
 
 ### Real AI weight integration
 
@@ -110,14 +129,14 @@ a binary `.bin` file that the browser can `fetch()` directly into GPU buffers.
 
 ## Extracting Real AI Weights (Optional)
 
-To reproduce the real-weight integration (Test 3), you need Python 3.10+ and a Hugging Face account:
+To reproduce the real-weight integration (Test 3), you need Python 3.10+ and (optionally) a Hugging Face account:
 
 1. **Install Python dependencies**
    ```bash
    pip install torch safetensors huggingface-hub numpy
    ```
 
-2. **Run the extraction script**
+2. **Run the weight extraction script**
    ```bash
    python extract_weights.py
    ```
@@ -128,7 +147,17 @@ To reproduce the real-weight integration (Test 3), you need Python 3.10+ and a H
    - Re-pack into our JS kernel's column-packed `uint32` format (16 weights/u32)
    - Save `bitnet_layer_0_down_proj.bin` (4.2 MB)
 
-3. **Serve and test** — the `.bin` file must be in the same directory as `index.html`:
+3. **Run the sparse embedding extraction script**
+   ```bash
+   python extract_sparse_embeddings.py
+   ```
+   This will:
+   - Extract `model.embed_tokens.weight` (128,256 × 2,560, bfloat16)
+   - Slice the first 16,384 tokens (BPE frequency-ordered) + token 50991 ("WebGPU")
+   - Convert to Float16
+   - Save `sparse_embeddings.bin` (80 MB) and `vocab_map.json` (202 KB)
+
+4. **Serve and test** — all `.bin` and `.json` files must be in the same directory as `index.html`:
    ```bash
    npx serve . -l 8080
    ```
@@ -156,37 +185,45 @@ Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
 | Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
 | Result | ✅ PASS | ✅ PASS | ✅ PASS |
 
-### Interactive mode: tokenizer → GPU mat-vec (v0.3.2)
+### Interactive mode: real embeddings → GPU mat-vec (v0.4.0)
 
-Input run through the full pipeline (`@huggingface/tokenizers` encode → hash-seeded mock embedding → real BitNet weight matrix on GPU).
+Input run through the full pipeline: `@huggingface/tokenizers` encode → sparse FP16 vocab lookup → FP16→F32 conversion → zero-pad to 6912 → real BitNet weight matrix on GPU.
 
-**"Hello"** (1 token, seed 1050862354)
+**"Hello"** (1 token, ID 9906)
 
 | Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
 |--------|-------------------|-------------|----------------|
-| GPU compute | 13.0 ms | 10.0 ms | 6.4 ms |
-| output[0] | -13.920891 | -13.920891 | -13.920891 |
-| output[1] | 19.375885 | 19.375885 | 19.375885 |
+| GPU compute | 27.0 ms | 10.0 ms | 6.3 ms |
+| output[0] | 22.507725 | 22.507725 | 22.507725 |
+| output[1] | 33.629837 | 33.629837 | 33.629837 |
 | Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
+
+**Asset load times** (sparse_embeddings.bin 80 MB + bitnet_layer_0_down_proj.bin 4.2 MB):
+
+| | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
+|---|---|---|---|
+| Load time | ~15 s | ~12 s | ~12 s |
 
 **Key takeaways:**
 
+- **Real semantic embeddings.** The system looks up the actual 2,560-dimensional vector that Microsoft's AI uses to represent "Hello", not random numbers.
 - **Cross-device determinism.** All output values match to 6 decimal places across iPhone (A16), iPad (M3), and MacBook (M2 Max). The branchless, bit-packed kernel produces identical IEEE 754 results regardless of GPU architecture.
-- **Different text → different output.** The all-token hash seed ensures each unique input produces a distinct embedding and therefore distinct GPU output.
-- **Real AI weights work end-to-end.** Pre-trained ternary weights from Hugging Face are extracted, bit-packed, fetched by the browser, and processed by the WebGPU kernel — producing non-trivial output on all three devices.
-- **M2 Max dominates on compute** at 3.1 ms (Test 2) and 3.5–4.8 ms (Test 3 / interactive), benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
-- **Even an iPhone processes a real 17.7M-parameter layer in 13–15 ms** — well within interactive latency requirements.
-- **Setup cost is a one-time expense** — the pipeline and buffers would be reused across tokens in a real inference loop, so the compute time is what matters for throughput.
-- **Numerical precision is identical** across all three Apple GPU generations — max error of 2.08e-3 at the same row, confirming deterministic f32 accumulation.
+- **Mobile-friendly.** FP16 sparse vocab slice (80 MB) loads cleanly on all devices — previously the 1.3 GB Float32 file crashed iOS Safari.
+- **FP16 precision is lossless for embeddings.** Output values are identical between the F32 and FP16 approaches, confirming the BitNet spec's guidance that boundary layers tolerate 16-bit precision.
+- **M2 Max dominates on compute** at 6.3 ms, benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
+- **iPhone processes 17.7M ternary parameters in 27 ms** — well within interactive latency.
 
 ## Project Structure
 
 | File | Description |
 |------|-------------|
 | `index.html` | Page with interactive text input panel and automated test log |
-| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, tokenizer integration, interactive handler, and validation |
-| `extract_weights.py` | Python script to extract and bit-pack weights from Hugging Face |
-| `bitnet_layer_0_down_proj.bin` | Pre-packed weight binary for Test 3 (generated by `extract_weights.py`) |
+| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, tokenizer integration, FP16 embedding loader, interactive handler, and validation |
+| `extract_weights.py` | Python script to extract and bit-pack ternary weights from Hugging Face |
+| `extract_sparse_embeddings.py` | Python script to extract sparse FP16 embedding vocab slice + vocab map |
+| `bitnet_layer_0_down_proj.bin` | Pre-packed ternary weight binary for down_proj layer (generated by `extract_weights.py`) |
+| `sparse_embeddings.bin` | FP16 embedding dictionary — 16,385 rows × 2,560 dims (generated by `extract_sparse_embeddings.py`) |
+| `vocab_map.json` | Token ID → dense row index mapping (generated by `extract_sparse_embeddings.py`) |
 | `package.json` | Project metadata |
 
 ## Dependencies

@@ -43,11 +43,14 @@
 
 import { Tokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/tokenizers';
 
-let tokenizer    = null;
-let gpuDevice     = null;   // kept alive for interactive use
-let realWeights   = null;   // Uint32Array – packed BitNet layer
-const REAL_M      = 2560;   // rows  (down_proj output dim)
-const REAL_K      = 6912;   // cols  (down_proj input  dim)
+let tokenizer      = null;
+let gpuDevice       = null;   // kept alive for interactive use
+let realWeights     = null;   // Uint32Array – packed BitNet layer
+let embeddingData   = null;   // Uint16Array – FP16 sparse embed_tokens
+let vocabMap        = null;   // Object – original token ID → dense row index
+const REAL_M        = 2560;   // rows  (down_proj output dim)
+const REAL_K        = 6912;   // cols  (down_proj input  dim)
+const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 
 /**
  * Fetch a URL using the browser Cache API so repeated loads are instant.
@@ -61,6 +64,63 @@ async function fetchWithCache(url) {
   const res = await fetch(url);
   await cache.put(url, res.clone());
   return res.json();
+}
+
+/**
+ * Convert a single IEEE 754 half-precision (FP16) value stored as a
+ * 16-bit unsigned integer into a standard JavaScript number (f64).
+ *
+ * Bit layout:  [15] sign  |  [14:10] exponent (5-bit)  |  [9:0] mantissa
+ */
+function fp16ToNumber(h) {
+  const sign = (h >>> 15) & 1;
+  const exp  = (h >>> 10) & 0x1f;
+  const mant = h & 0x3ff;
+
+  let val;
+  if (exp === 0) {
+    // Sub-normal or zero
+    val = (mant / 1024) * Math.pow(2, -14);
+  } else if (exp === 31) {
+    // Inf / NaN
+    val = mant === 0 ? Infinity : NaN;
+  } else {
+    // Normal
+    val = (1 + mant / 1024) * Math.pow(2, exp - 15);
+  }
+  return sign ? -val : val;
+}
+
+/**
+ * Fetch and store the sparse FP16 embedding dictionary plus the
+ * vocab map that translates original token IDs → dense row indices.
+ *
+ * Files:
+ *   sparse_embeddings.bin – flat row-major float16 (rows × EMBED_DIM)
+ *   vocab_map.json        – { "<tokenId>": <rowIndex>, … }
+ */
+async function loadEmbeddings() {
+  log('Loading sparse embeddings (FP16) …', 'info');
+
+  // Fetch vocab map and binary embeddings in parallel
+  const [mapResp, binResp] = await Promise.all([
+    fetch('vocab_map.json'),
+    fetch('sparse_embeddings.bin'),
+  ]);
+  if (!mapResp.ok) throw new Error(`vocab_map.json fetch failed: HTTP ${mapResp.status}`);
+  if (!binResp.ok) throw new Error(`sparse_embeddings.bin fetch failed: HTTP ${binResp.status}`);
+
+  vocabMap = await mapResp.json();
+  const buf = await binResp.arrayBuffer();
+  embeddingData = new Uint16Array(buf);
+
+  const totalRows = embeddingData.length / EMBED_DIM;
+  const mapEntries = Object.keys(vocabMap).length;
+  log(`✔ Embeddings loaded: ${totalRows.toLocaleString()} rows × ${EMBED_DIM} dims ` +
+      `(${(buf.byteLength / 1024 / 1024).toFixed(1)} MB, FP16)`, 'info');
+  log(`✔ Vocab map loaded: ${mapEntries.toLocaleString()} token ID entries ` +
+      `(${(JSON.stringify(vocabMap).length / 1024).toFixed(0)} KB)`, 'info');
+  log('');
 }
 
 /**
@@ -384,32 +444,34 @@ function generateMatrixTestData(M, K, seed = 123) {
 }
 
 // ════════════════════════════════════════════════
-// 5b. Token-Seeded Mock Embedding
+// 5b. Real Embedding Lookup + CPU-Side Pad (Sparse FP16)
 // ════════════════════════════════════════════════
 
 /**
- * Convert text → mock embedding vector suitable for run2DKernel.
+ * Look up the real high-precision embedding for `text` via the
+ * sparse FP16 dictionary and pad to `targetK` for the GPU kernel.
  *
  * Steps:
- *   1. Tokenize `text` with the loaded transformers.js tokenizer.
- *   2. Take the LAST token ID (simulates the "current step").
- *   3. Seed a deterministic PRNG with that token ID.
- *   4. Fill a Float32Array(K) with values in [-1.0, 1.0].
+ *   1. Tokenize `text` with the loaded tokenizer.
+ *   2. Take the FIRST token ID (index 0) — the primary semantic token.
+ *   3. Look up the token ID in `vocabMap` to get the dense row index.
+ *      If the token is out-of-vocabulary, fall back to row 0.
+ *   4. Read EMBED_DIM FP16 values from `embeddingData`, convert to f32.
+ *   5. Create a Float32Array(targetK) and copy the f32 values in,
+ *      zero-padding the remainder to bridge EMBED_DIM → REAL_K.
  *
- * The same text always produces the same embedding, making results
- * reproducible while still being driven by real tokenizer output.
- *
- * @param {string} text  – input text to tokenize
- * @param {number} K     – embedding dimension (weight-matrix columns)
- * @returns {Float32Array} mock embedding of length K
+ * @param {string} text    – input text to tokenize
+ * @param {number} targetK – required input length for the GPU kernel
+ * @returns {Float32Array}   zero-padded embedding of length targetK
  */
-function textToMockEmbedding(text, K) {
+function getRealEmbedding(text, targetK) {
   if (!tokenizer) {
     throw new Error('Tokenizer not initialised – call initTokenizer() first.');
   }
+  if (!embeddingData || !vocabMap) {
+    throw new Error('Embeddings not loaded – call loadEmbeddings() first.');
+  }
 
-  // Standalone @huggingface/tokenizers: encode() returns
-  // { ids: number[], tokens: string[], attention_mask: number[] }.
   const encoded = tokenizer.encode(text);
   const ids = encoded.ids;
 
@@ -417,27 +479,34 @@ function textToMockEmbedding(text, K) {
     throw new Error('Tokenizer produced an empty sequence.');
   }
 
-  // Combine ALL token IDs into a single seed so that different
-  // inputs always produce different embeddings.  A simple hash:
-  //   seed = id[0]*p^0  ^  id[1]*p^1  ^  …   (wrapping to i32)
-  // This avoids the problem of a trailing special token (e.g. 0)
-  // making every input map to the same seed.
-  let seed = 0;
-  for (let i = 0; i < ids.length; i++) {
-    // Math.imul keeps us in 32-bit integer range; XOR mixes bits
-    seed = (seed ^ Math.imul(ids[i], 2654435761 + (i << 2))) | 0;
+  // Use the FIRST token ID as the primary semantic representative
+  const tokenId = ids[0];
+
+  // Look up dense row index via vocab map; fall back to row 0 (OOV)
+  let rowIndex = vocabMap[String(tokenId)];
+  let oov = false;
+  if (rowIndex === undefined) {
+    rowIndex = 0;
+    oov = true;
   }
 
+  // Read EMBED_DIM FP16 values and convert to Float32
+  const fp16Start = rowIndex * EMBED_DIM;
+  const embedding = new Float32Array(EMBED_DIM);
+  for (let i = 0; i < EMBED_DIM; i++) {
+    embedding[i] = fp16ToNumber(embeddingData[fp16Start + i]);
+  }
+
+  const oovTag = oov ? ' [OOV → fallback row 0]' : '';
   log(`  Tokenized "${text.length > 40 ? text.slice(0, 37) + '…' : text}"` +
-      ` → ${ids.length} tokens, seed = ${seed >>> 0}`, 'info');
+      ` → ${ids.length} token(s), first ID = ${tokenId}${oovTag}`, 'info');
+  log(`  Real embedding (FP16→F32): ${EMBED_DIM} dims → zero-padded to ${targetK}`, 'info');
 
-  // Deterministic PRNG seeded by the combined token hash
-  const rng = mulberry32(seed);
-  const embedding = new Float32Array(K);
-  for (let i = 0; i < K; i++) {
-    embedding[i] = rng() * 2 - 1;   // range [-1.0, 1.0]
-  }
-  return embedding;
+  // CPU-side pad: copy EMBED_DIM values into a targetK-length buffer
+  // Remaining slots stay 0.0 (Float32Array is zero-initialised)
+  const padded = new Float32Array(targetK);
+  padded.set(embedding);
+  return padded;
 }
 
 // ════════════════════════════════════════════════
@@ -790,8 +859,9 @@ async function main() {
   log("╚════════════════════════════════════════════════════════╝");
   log("");
 
-  // ── Tokenizer ──
+  // ── Tokenizer + Embeddings ──
   await initTokenizer();
+  await loadEmbeddings();
 
   const device = await initWebGPU();
   log("✔ WebGPU device acquired", "info");
@@ -1100,8 +1170,8 @@ async function onComputeClick() {
   };
 
   try {
-    // 1. Tokenize → mock embedding
-    const embedding = textToMockEmbedding(text, REAL_K);
+    // 1. Tokenize → real embedding (zero-padded to REAL_K)
+    const embedding = getRealEmbedding(text, REAL_K);
 
     // 2. Run through real BitNet weights on the GPU
     const {
