@@ -51,11 +51,14 @@ let upWeights       = null;   // Uint32Array – packed up_proj   (6912×2560)
 let downWeights     = null;   // Uint32Array – packed down_proj (2560×6912)
 let embeddingData   = null;   // Uint16Array – FP16 sparse embed_tokens
 let vocabMap        = null;   // Object – original token ID → dense row index
+let lmHeadWeights   = null;   // Float32Array – dense LM head (vocab-sliced)
+let reverseVocabMap = null;   // Object – dense row index → original token ID
 const HIDDEN_DIM    = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 const MLP_DIM       = 6912;   // intermediate_size (SwiGLU)
 const REAL_M        = 2560;   // rows  (down_proj output dim) — kept for Test 3
 const REAL_K        = 6912;   // cols  (down_proj input  dim) — kept for Test 3
 const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
+const LM_HEAD_ROWS  = 16385;  // vocab-sliced rows (16384 + 1 for "WebGPU")
 
 /**
  * Fetch a URL using the browser Cache API so repeated loads are instant.
@@ -125,6 +128,46 @@ async function loadEmbeddings() {
       `(${(buf.byteLength / 1024 / 1024).toFixed(1)} MB, FP16)`, 'info');
   log(`✔ Vocab map loaded: ${mapEntries.toLocaleString()} token ID entries ` +
       `(${(JSON.stringify(vocabMap).length / 1024).toFixed(0)} KB)`, 'info');
+  log('');
+}
+
+/**
+ * Fetch the sparse FP16 LM head weights and decode to Float32.
+ * Also builds the reverse vocab map (dense index → original token ID).
+ *
+ * File: sparse_lm_head.bin – flat row-major float16 (LM_HEAD_ROWS × HIDDEN_DIM)
+ */
+async function loadLMHead() {
+  log('Loading sparse LM head (FP16) …', 'info');
+
+  const resp = await fetch('sparse_lm_head.bin');
+  if (!resp.ok) throw new Error(`sparse_lm_head.bin fetch failed: HTTP ${resp.status}`);
+  const buf = await resp.arrayBuffer();
+  const fp16 = new Uint16Array(buf);
+
+  const expectedLen = LM_HEAD_ROWS * HIDDEN_DIM;
+  if (fp16.length !== expectedLen) {
+    throw new Error(`LM head size mismatch: got ${fp16.length}, expected ${expectedLen}`);
+  }
+
+  // Decode FP16 → Float32 (reuse the existing fp16ToNumber helper)
+  lmHeadWeights = new Float32Array(fp16.length);
+  for (let i = 0; i < fp16.length; i++) {
+    lmHeadWeights[i] = fp16ToNumber(fp16[i]);
+  }
+
+  log(`✔ LM head loaded: ${LM_HEAD_ROWS.toLocaleString()} rows × ${HIDDEN_DIM} dims ` +
+      `(${(buf.byteLength / 1024 / 1024).toFixed(1)} MB FP16 → ` +
+      `${(lmHeadWeights.byteLength / 1024 / 1024).toFixed(1)} MB F32)`, 'info');
+
+  // Build reverse vocab map: dense row index → original token ID string
+  if (vocabMap) {
+    reverseVocabMap = {};
+    for (const [tokenId, rowIdx] of Object.entries(vocabMap)) {
+      reverseVocabMap[String(rowIdx)] = tokenId;
+    }
+    log(`✔ Reverse vocab map built: ${Object.keys(reverseVocabMap).length.toLocaleString()} entries`, 'info');
+  }
   log('');
 }
 
@@ -510,6 +553,68 @@ function getRealEmbedding(text) {
 }
 
 // ════════════════════════════════════════════════
+// 5c-LM. WGSL – Dense LM Head Mat-Vec (Float32, NOT ternary)
+// ════════════════════════════════════════════════
+//
+// Architecture
+// ────────────
+//   Dense (non-bit-packed) matrix–vector multiply for the LM head.
+//   The LM head is stored as full-precision Float32 (decoded from FP16).
+//   Computes  logits[row] = Σ_col  lm_head[row, col] · input[col]
+//   One workgroup per output row (M workgroups dispatched).
+//
+
+const SHADER_LM_HEAD = /* wgsl */ `
+
+const WG_SIZE: u32 = ${WORKGROUP_SIZE}u;
+
+struct Params {
+  M: u32,   // rows (vocab size = 16385)
+  K: u32,   // cols (hidden_dim = 2560)
+}
+
+@group(0) @binding(0) var<storage, read>       input_vec:  array<f32>;
+@group(0) @binding(1) var<storage, read>       weight_mat: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_vec: array<f32>;
+@group(0) @binding(3) var<uniform>             params:     Params;
+
+var<workgroup> shared_acc: array<f32, ${WORKGROUP_SIZE}>;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(
+  @builtin(workgroup_id)        wid: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+) {
+  let row = wid.x;
+  let tid = lid.x;
+
+  if (row >= params.M) { return; }
+
+  // Each thread accumulates a strided portion of the dot-product
+  var acc: f32 = 0.0;
+  let row_offset = row * params.K;
+  for (var col: u32 = tid; col < params.K; col = col + WG_SIZE) {
+    acc = acc + weight_mat[row_offset + col] * input_vec[col];
+  }
+
+  // Parallel reduction across workgroup
+  shared_acc[tid] = acc;
+  workgroupBarrier();
+
+  for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      shared_acc[tid] = shared_acc[tid] + shared_acc[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    output_vec[row] = shared_acc[0];
+  }
+}
+`;
+
+// ════════════════════════════════════════════════
 // 5c. WGSL – SiLU · Element-wise Multiply (SwiGLU fusion)
 // ════════════════════════════════════════════════
 //
@@ -559,10 +664,23 @@ async function initWebGPU() {
   }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("No GPU adapter found.");
-  const device = await adapter.requestDevice();
+
+  // Request the adapter's actual hardware limits instead of spec
+  // defaults.  The LM Head weight buffer is ~160 MB (F32), which
+  // exceeds the default maxStorageBufferBindingSize of 128 MB.
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize:               adapter.limits.maxBufferSize,
+    },
+  });
   device.lost.then((info) =>
     console.error(`WebGPU device lost: ${info.message}`),
   );
+
+  log(`  maxStorageBufferBindingSize: ${(device.limits.maxStorageBufferBindingSize / 1024 / 1024).toFixed(0)} MB`, 'info');
+  log(`  maxBufferSize:               ${(device.limits.maxBufferSize / 1024 / 1024).toFixed(0)} MB`, 'info');
+
   return device;
 }
 
@@ -948,6 +1066,142 @@ async function runSiLUMulKernel(device, gateData, upData, n) {
 }
 
 // ════════════════════════════════════════════════
+// 8b-LM. LM Head Kernel – Dense Float32 Mat-Vec
+// ════════════════════════════════════════════════
+
+/**
+ * Run the dense LM head matrix–vector multiply on the GPU.
+ *   logits[row] = Σ_col  lmHeadWeights[row, col] · inputVec[col]
+ *
+ * @param {GPUDevice}    device      – WebGPU device
+ * @param {Float32Array} lmWeights   – flat row-major (M × K) float32
+ * @param {Float32Array} inputVec    – hidden state vector (length K)
+ * @param {number}       M           – number of rows (vocab size = 16385)
+ * @param {number}       K           – number of cols (hidden_dim = 2560)
+ * @returns {{ results: Float32Array, setupMs: number, computeMs: number }}
+ */
+async function runLMHeadKernel(device, lmWeights, inputVec, M, K) {
+  const setupT0 = performance.now();
+
+  // ── Buffers ──
+  const inputBuf = device.createBuffer({
+    label: "lm-head-input",
+    size:  K * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(inputBuf, 0, new Float32Array(inputVec));
+
+  const weightBuf = device.createBuffer({
+    label: "lm-head-weights",
+    size:  lmWeights.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(weightBuf, 0, lmWeights);
+
+  const resultBuf = device.createBuffer({
+    label: "lm-head-result",
+    size:  M * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  const stagingBuf = device.createBuffer({
+    label: "lm-head-staging",
+    size:  M * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const uniformBuf = device.createBuffer({
+    label: "lm-head-params",
+    size:  16,   // M + K = 2 × u32, padded to 16 for WebGPU alignment
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuf, 0, new Uint32Array([M, K, 0, 0]));
+
+  // ── Pipeline ──
+  const module = device.createShaderModule({ code: SHADER_LM_HEAD });
+  const bgl = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    compute: { module, entryPoint: "main" },
+  });
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: weightBuf } },
+      { binding: 2, resource: { buffer: resultBuf } },
+      { binding: 3, resource: { buffer: uniformBuf } },
+    ],
+  });
+
+  const setupMs = performance.now() - setupT0;
+
+  // ── Dispatch: one workgroup per vocab row ──
+  const computeT0 = performance.now();
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(M);
+  pass.end();
+  encoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, M * 4);
+  device.queue.submit([encoder.finish()]);
+
+  await stagingBuf.mapAsync(GPUMapMode.READ);
+  const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
+  stagingBuf.unmap();
+
+  const computeMs = performance.now() - computeT0;
+
+  [inputBuf, weightBuf, resultBuf, stagingBuf, uniformBuf].forEach((b) =>
+    b.destroy(),
+  );
+  return { results, setupMs, computeMs };
+}
+
+/**
+ * Return the index of the maximum value in a typed array.
+ */
+function argmax(arr) {
+  let maxIdx = 0;
+  let maxVal = -Infinity;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] > maxVal) {
+      maxVal = arr[i];
+      maxIdx = i;
+    }
+  }
+  return maxIdx;
+}
+
+/**
+ * CPU-side RMSNorm – squishes values into a safe range so the
+ * LM Head dot products don't overflow FP32.
+ *
+ * In the real model an RMSNorm layer (with learned weights) sits
+ * between the MLP output and the LM Head.  We skip those weights
+ * for now and just apply the mathematical normalisation:
+ *   rms = sqrt( mean(x²) + ε )
+ *   out[i] = x[i] / rms
+ */
+function simpleRMSNorm(arr) {
+  const n = arr.length;
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) sumSq += arr[i] * arr[i];
+  const rms = Math.sqrt(sumSq / n + 1e-6);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = arr[i] / rms;
+  return out;
+}
+
+// ════════════════════════════════════════════════
 // 8c. Unified Full MLP – Zero-Copy GPU Pipeline
 // ════════════════════════════════════════════════
 //
@@ -1248,9 +1502,10 @@ async function main() {
   log("╚════════════════════════════════════════════════════════╝");
   log("");
 
-  // ── Tokenizer + Embeddings ──
+  // ── Tokenizer + Embeddings + LM Head ──
   await initTokenizer();
   await loadEmbeddings();
+  await loadLMHead();
 
   const device = await initWebGPU();
   log("✔ WebGPU device acquired", "info");
@@ -1562,8 +1817,8 @@ async function main() {
   gpuDevice = device;
   log("");
 
-  if (gateWeights && upWeights && downWeights) {
-    log("✔ Interactive mode ready (full SwiGLU MLP) – type text above and click Compute!", "pass");
+  if (gateWeights && upWeights && downWeights && lmHeadWeights) {
+    log("✔ Interactive mode ready (SwiGLU MLP + LM Head) – type text above and click Compute!", "pass");
     const inputEl = document.getElementById("user-text");
     const btnEl   = document.getElementById("compute-btn");
     if (inputEl) inputEl.disabled = false;
@@ -1589,9 +1844,12 @@ async function main() {
 /**
  * Called when the user clicks "Compute" (or presses Enter).
  *
- * Full SwiGLU MLP pipeline (Layer 0) – unified GPU orchestration:
- *   All 4 compute passes run in a SINGLE command encoder submission.
- *   Intermediate tensors never leave VRAM.
+ * Full pipeline: Embedding → SwiGLU MLP → LM Head → Argmax → Decode
+ *   1. Tokenize input → look up real embedding (2560 dims)
+ *   2. Run SwiGLU MLP on GPU (gate_proj, up_proj, SiLU·mul, down_proj)
+ *   3. Run dense LM Head mat-vec on GPU → logits array
+ *   4. Argmax → winning sparse index → reverse vocab map → token ID
+ *   5. Decode token ID with the Llama 3 tokenizer → English word
  */
 async function onComputeClick() {
   const inputEl  = document.getElementById("user-text");
@@ -1619,33 +1877,87 @@ async function onComputeClick() {
     // 1. Tokenize → real embedding (2560 dims, no padding)
     const emb = getRealEmbedding(text);
 
-    // 2. Run full SwiGLU MLP in a single GPU submission
-    const { results, setupMs, computeMs } = await runFullMLP(
+    // 2. Run full SwiGLU MLP (unified GPU, zero CPU round-trips)
+    const { results: mlpOut, setupMs: mlpSetup, computeMs: mlpCompute } = await runFullMLP(
       gpuDevice, gateWeights, upWeights, downWeights,
       emb, HIDDEN_DIM, MLP_DIM,
     );
 
-    // 3. Display results
+    // 2b. RMSNorm – squish MLP output into a safe range before LM Head.
+    //     Without this the ~140K-scale values overflow FP32 dot products.
+    const mlpMax = mlpOut.reduce((a, b) => Math.max(a, Math.abs(b)), 0);
+    const normedMlp = simpleRMSNorm(mlpOut);
+    const normMax = normedMlp.reduce((a, b) => Math.max(a, Math.abs(b)), 0);
+
+    // 3. Run LM Head (dense mat-vec: 16385 × 2560)
+    const { results: logits, setupMs: lmSetup, computeMs: lmCompute } = await runLMHeadKernel(
+      gpuDevice, lmHeadWeights, normedMlp, LM_HEAD_ROWS, HIDDEN_DIM,
+    );
+
+    // 4. Argmax → winning sparse index
+    const sparseIdx = argmax(logits);
+    const topLogit  = logits[sparseIdx];
+
+    // 5. Reverse vocab map → original token ID → decode
+    let origTokenId = null;
+    let decodedWord = '???';
+    if (reverseVocabMap && reverseVocabMap[String(sparseIdx)] !== undefined) {
+      origTokenId = parseInt(reverseVocabMap[String(sparseIdx)], 10);
+      if (tokenizer) {
+        try {
+          decodedWord = tokenizer.decode([origTokenId], true);
+        } catch {
+          decodedWord = `<decode-error: ID ${origTokenId}>`;
+        }
+      }
+    } else {
+      decodedWord = `<unmapped sparse index ${sparseIdx}>`;
+    }
+
+    // 6. Display results
     outEl.textContent = "";
     ilog(`Input : "${text}"`);
     ilog("");
-    ilog(`SwiGLU MLP Pipeline (Layer 0) – Unified GPU:`, "info");
-    ilog(`  Setup (buffers + pipelines) : ${setupMs.toFixed(3)} ms`, "info");
-    ilog(`  Compute (submit + readback) : ${computeMs.toFixed(3)} ms`, "info");
-    ilog(`  ─────────────────────────────────────`);
-    ilog(`  Total                       : ${(setupMs + computeMs).toFixed(3)} ms`, "info");
+
+    ilog(`═══════════════════════════════════════════`, "info");
+    ilog(`  PREDICTED WORD:  "${decodedWord}"`, "pass bold");
+    ilog(`  Token ID: ${origTokenId}  |  Sparse Index: ${sparseIdx}  |  Logit: ${topLogit.toFixed(4)}`, "info");
+    ilog(`═══════════════════════════════════════════`, "info");
     ilog("");
 
-    // Show last 10 values of final output (2560-dim vector)
-    const startIdx = results.length - 10;
-    ilog("┌───────┬──────────────────┐");
-    ilog("│  Idx  │    GPU Output     │");
-    ilog("├───────┼──────────────────┤");
-    for (let i = startIdx; i < results.length; i++) {
-      const val = results[i].toFixed(6).padStart(16);
-      ilog(`│ ${String(i).padStart(5)} │ ${val} │`);
+    const totalSetup   = mlpSetup + lmSetup;
+    const totalCompute = mlpCompute + lmCompute;
+    ilog(`Pipeline Timing:`, "info");
+    ilog(`  MLP Setup   : ${mlpSetup.toFixed(3)} ms   |  MLP Compute  : ${mlpCompute.toFixed(3)} ms`, "info");
+    ilog(`  LM Head Setup: ${lmSetup.toFixed(3)} ms   |  LM Head Compute: ${lmCompute.toFixed(3)} ms`, "info");
+    ilog(`  ─────────────────────────────────────`);
+    ilog(`  Total Setup  : ${totalSetup.toFixed(3)} ms   |  Total Compute: ${totalCompute.toFixed(3)} ms`, "info");
+    ilog(`  Grand Total  : ${(totalSetup + totalCompute).toFixed(3)} ms`, "info");
+    ilog("");
+    ilog(`RMSNorm: max |MLP raw| = ${mlpMax.toFixed(2)} → max |normed| = ${normMax.toFixed(6)}`, "info");
+    ilog("");
+
+    // Top-5 logits for insight
+    const indices = Array.from({length: logits.length}, (_, i) => i);
+    indices.sort((a, b) => logits[b] - logits[a]);
+    ilog("Top 5 Predictions:", "info");
+    ilog("┌──────┬────────────┬──────────────┬──────────────────┐");
+    ilog("│ Rank │ Sparse Idx │   Token ID   │      Word        │");
+    ilog("├──────┼────────────┼──────────────┼──────────────────┤");
+    for (let r = 0; r < 5; r++) {
+      const si = indices[r];
+      const tid = reverseVocabMap ? reverseVocabMap[String(si)] : '?';
+      let word = '?';
+      if (tid !== undefined && tokenizer) {
+        try { word = tokenizer.decode([parseInt(tid, 10)], true); } catch { word = '?'; }
+      }
+      const rank = String(r + 1).padStart(4);
+      const sidx = String(si).padStart(10);
+      const tidStr = String(tid ?? '?').padStart(12);
+      const wStr = word.padStart(16);
+      ilog(`│ ${rank} │ ${sidx} │ ${tidStr} │ ${wStr} │`);
     }
-    ilog("└───────┴──────────────────┘");
+    ilog("└──────┴────────────┴──────────────┴──────────────────┘");
   } catch (err) {
     ilog(`❌ Error: ${err.message}`, "fail");
     console.error(err);

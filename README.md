@@ -30,8 +30,11 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] SiLU activation WGSL compute shader for SwiGLU fusion
 - [x] Unified GPU orchestration — single command encoder, zero CPU round-trips
 - [x] Cross-device bit-exact determinism verified (M2 Max / M3 iPad / A16 iPhone)
-- [ ] LM Head — map MLP output to vocabulary logits
-- [ ] RMSNorm — proper layer normalization
+- [x] LM Head — dense FP32 mat-vec maps MLP output to vocabulary logits (16,385 × 2,560)
+- [x] RMSNorm — CPU-side normalization prevents FP32 overflow in LM Head
+- [x] End-to-end text-in → word-out pipeline (Embed → MLP → RMSNorm → LM Head → Argmax → Decode)
+- [x] Adapter-aware WebGPU limits (requests hardware max `maxStorageBufferBindingSize`)
+- [ ] Real RMSNorm weights from model
 - [ ] Attention block
 - [ ] Multi-layer inference pipeline
 
@@ -161,6 +164,34 @@ files that the browser can `fetch()` directly into GPU buffers.
    
    Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results. Tests 1 and 2 run CPU-vs-GPU validation with synthetic data. Test 3 runs a real AI weight matrix through the WebGPU kernel.
 
+## Testing on Mobile Devices (iPhone / iPad)
+
+WebGPU requires a **secure context** (`https://`). Browsers make a special exception for `localhost`, but if you try to access your MacBook via its local IP address (e.g. `http://192.168.1.X:8080`), mobile Safari/Chrome will block WebGPU.
+
+The fastest solution is **ngrok**, which creates a temporary `https://` tunnel from the internet to your local server.
+
+1. **Keep your local server running** in one terminal:
+   ```bash
+   npx serve . -l 8080
+   ```
+
+2. **Open a second terminal** and start ngrok:
+   ```bash
+   npx ngrok http 8080
+   ```
+
+3. **Copy the secure URL** from the ngrok output. Look for the **Forwarding** line:
+   ```
+   Forwarding    https://a1b2-c3d4.ngrok-free.app -> http://localhost:8080
+   ```
+
+4. **Open that `https://` URL** on your iPhone or iPad.
+   - WebGPU will be fully enabled because the connection is `https`.
+   - The `.bin` weight files are served directly from your MacBook over your local network — nothing is uploaded to the internet.
+   - First load will take a few seconds as the ~175 MB of weight files transfer over Wi-Fi.
+
+> **Note:** You can install ngrok globally (`npm i -g ngrok`) or use `npx` for zero-install one-off usage. A free ngrok account is sufficient — the only limitation is a random subdomain that changes each session.
+
 ## Extracting Real AI Weights (Optional)
 
 To reproduce the real-weight integration (Test 3), you need Python 3.10+ and (optionally) a Hugging Face account:
@@ -191,7 +222,17 @@ To reproduce the real-weight integration (Test 3), you need Python 3.10+ and (op
    - Convert to Float16
    - Save `sparse_embeddings.bin` (80 MB) and `vocab_map.json` (202 KB)
 
-4. **Serve and test** — all `.bin` and `.json` files must be in the same directory as `index.html`:
+4. **Run the LM head extraction script**
+   ```bash
+   python extract_lm_head.py
+   ```
+   This will:
+   - Extract `model.embed_tokens.weight` (the model uses tied embeddings — the embedding matrix doubles as the LM head)
+   - Apply the exact same vocab-slice as the embeddings (rows 0–16,383 + row 50,991)
+   - Convert to Float16
+   - Save `sparse_lm_head.bin` (80 MB)
+
+5. **Serve and test** — all `.bin` and `.json` files must be in the same directory as `index.html`:
    ```bash
    npx serve . -l 8080
    ```
@@ -257,6 +298,43 @@ Input run through the complete SwiGLU pipeline: `@huggingface/tokenizers` encode
 - **M2 Max processes 52.7M ternary parameters in 7.2ms** — ~140 MLP blocks/second.
 - **iPhone processes the same in 38ms** — well within interactive latency for a phone.
 
+### End-to-end prediction: Embed → MLP → RMSNorm → LM Head → Decode (v0.6.0)
+
+Full pipeline: `@huggingface/tokenizers` encode → sparse FP16 embedding → unified GPU SwiGLU MLP → CPU RMSNorm → GPU dense LM Head (16,385 × 2,560) → argmax → reverse vocab map → tokenizer decode.
+
+**"Hello"** (1 token, ID 9906) — first word prediction
+
+| Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
+|--------|-------------------|-------------|----------------|
+| maxStorageBufferBindingSize | 1024 MB | 1024 MB | 4096 MB |
+| MLP Compute | 37 ms | 23 ms | 34 ms |
+| LM Head Compute | 338 ms | 255 ms | 74.5 ms |
+| **Total Compute** | **375 ms** | **278 ms** | **108.5 ms** |
+| Predicted word | `" volume"` | `" volume"` | `" volume"` |
+| Token ID | 8286 | 8286 | 8286 |
+| Logit | 207.9285 | 207.9285 | 207.9285 |
+| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
+
+**Top 5 predictions (all devices identical):**
+
+| Rank | Word | Token ID | Logit |
+|------|------|----------|-------|
+| 1 | volume | 8286 | 207.93 |
+| 2 | Count | 4605 | — |
+| 3 | mass | 3148 | — |
+| 4 | Mass | 9346 | — |
+| 5 | Ma | 11583 | — |
+
+**Key takeaways:**
+
+- **End-to-end text → word.** The complete pipeline — embedding lookup, ternary SwiGLU MLP, RMSNorm, dense LM Head, argmax decode — produces a real English word on all three devices.
+- **Semantic coherence.** All top-5 predictions (volume, Count, mass, Mass, Ma) cluster around measurement/quantity concepts, demonstrating the network's learned weight structure produces meaningful semantic groupings even through a single MLP layer without attention.
+- **Adapter-aware limits.** By requesting `adapter.limits.maxStorageBufferBindingSize`, all devices successfully allocated the 160 MB LM Head buffer (default spec limit is 128 MB).
+- **RMSNorm prevents overflow.** The MLP outputs ~564,000-scale values. Without normalization, these overflow FP32 dot products in the LM Head → NaN → 0.0. The CPU-side RMSNorm squishes to ~4.09 max, enabling safe computation.
+- **Cross-device bit-exact determinism.** Token ID 8286, logit 207.9285 — identical across A16, M3, and M2 Max.
+- **iPhone handles 160 MB GPU buffer.** The A16 Bionic granted 1024 MB of storage buffer space — no OOM crashes.
+- **M2 Max wider memory bus shows on dense mat-vec.** The M3 iPad beats the M2 Max on ternary MLP (23ms vs 34ms) but the M2 Max dominates the dense FP32 LM Head (74ms vs 255ms) thanks to its wider memory bandwidth.
+
 ## Project Structure
 
 | File | Description |
@@ -266,11 +344,13 @@ Input run through the complete SwiGLU pipeline: `@huggingface/tokenizers` encode
 | `extract_weights.py` | Python script to extract and bit-pack ternary weights from Hugging Face (single layer) |
 | `extract_full_mlp.py` | Python script to extract & pack all 3 MLP weight matrices (gate, up, down) |
 | `extract_sparse_embeddings.py` | Python script to extract sparse FP16 embedding vocab slice + vocab map |
+| `extract_lm_head.py` | Python script to extract vocab-sliced FP16 LM head weights (tied embeddings) |
 | `bitnet_layer_0_gate_proj.bin` | Pre-packed ternary weight binary for gate_proj (generated by `extract_full_mlp.py`) |
 | `bitnet_layer_0_up_proj.bin` | Pre-packed ternary weight binary for up_proj (generated by `extract_full_mlp.py`) |
 | `bitnet_layer_0_down_proj.bin` | Pre-packed ternary weight binary for down_proj (generated by `extract_full_mlp.py`) |
 | `sparse_embeddings.bin` | FP16 embedding dictionary — 16,385 rows × 2,560 dims (generated by `extract_sparse_embeddings.py`) |
 | `vocab_map.json` | Token ID → dense row index mapping (generated by `extract_sparse_embeddings.py`) |
+| `sparse_lm_head.bin` | FP16 LM head weights — 16,385 rows × 2,560 dims (generated by `extract_lm_head.py`) |
 | `package.json` | Project metadata |
 
 ## Dependencies
