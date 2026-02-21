@@ -45,11 +45,16 @@ import { Tokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/tokenizers'
 
 let tokenizer      = null;
 let gpuDevice       = null;   // kept alive for interactive use
-let realWeights     = null;   // Uint32Array – packed BitNet layer
+let realWeights     = null;   // Uint32Array – packed down_proj (kept for Test 3 compat)
+let gateWeights     = null;   // Uint32Array – packed gate_proj (6912×2560)
+let upWeights       = null;   // Uint32Array – packed up_proj   (6912×2560)
+let downWeights     = null;   // Uint32Array – packed down_proj (2560×6912)
 let embeddingData   = null;   // Uint16Array – FP16 sparse embed_tokens
 let vocabMap        = null;   // Object – original token ID → dense row index
-const REAL_M        = 2560;   // rows  (down_proj output dim)
-const REAL_K        = 6912;   // cols  (down_proj input  dim)
+const HIDDEN_DIM    = 2560;   // hidden_size of bitnet-b1.58-2B-4T
+const MLP_DIM       = 6912;   // intermediate_size (SwiGLU)
+const REAL_M        = 2560;   // rows  (down_proj output dim) — kept for Test 3
+const REAL_K        = 6912;   // cols  (down_proj input  dim) — kept for Test 3
 const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 
 /**
@@ -449,7 +454,7 @@ function generateMatrixTestData(M, K, seed = 123) {
 
 /**
  * Look up the real high-precision embedding for `text` via the
- * sparse FP16 dictionary and pad to `targetK` for the GPU kernel.
+ * sparse FP16 dictionary.
  *
  * Steps:
  *   1. Tokenize `text` with the loaded tokenizer.
@@ -457,14 +462,13 @@ function generateMatrixTestData(M, K, seed = 123) {
  *   3. Look up the token ID in `vocabMap` to get the dense row index.
  *      If the token is out-of-vocabulary, fall back to row 0.
  *   4. Read EMBED_DIM FP16 values from `embeddingData`, convert to f32.
- *   5. Create a Float32Array(targetK) and copy the f32 values in,
- *      zero-padding the remainder to bridge EMBED_DIM → REAL_K.
  *
- * @param {string} text    – input text to tokenize
- * @param {number} targetK – required input length for the GPU kernel
- * @returns {Float32Array}   zero-padded embedding of length targetK
+ * Returns the raw Float32Array of size EMBED_DIM (2560).
+ *
+ * @param {string} text – input text to tokenize
+ * @returns {Float32Array} embedding of length EMBED_DIM
  */
-function getRealEmbedding(text, targetK) {
+function getRealEmbedding(text) {
   if (!tokenizer) {
     throw new Error('Tokenizer not initialised – call initTokenizer() first.');
   }
@@ -500,14 +504,46 @@ function getRealEmbedding(text, targetK) {
   const oovTag = oov ? ' [OOV → fallback row 0]' : '';
   log(`  Tokenized "${text.length > 40 ? text.slice(0, 37) + '…' : text}"` +
       ` → ${ids.length} token(s), first ID = ${tokenId}${oovTag}`, 'info');
-  log(`  Real embedding (FP16→F32): ${EMBED_DIM} dims → zero-padded to ${targetK}`, 'info');
+  log(`  Real embedding (FP16→F32): ${EMBED_DIM} dims`, 'info');
 
-  // CPU-side pad: copy EMBED_DIM values into a targetK-length buffer
-  // Remaining slots stay 0.0 (Float32Array is zero-initialised)
-  const padded = new Float32Array(targetK);
-  padded.set(embedding);
-  return padded;
+  return embedding;
 }
+
+// ════════════════════════════════════════════════
+// 5c. WGSL – SiLU · Element-wise Multiply (SwiGLU fusion)
+// ════════════════════════════════════════════════
+//
+//  SwiGLU(x) = SiLU(gate_proj(x)) ⊙ up_proj(x)
+//  SiLU(g)   = g / (1 + exp(-g))    (a.k.a. swish with β=1)
+//
+//  This shader takes two f32 vectors of size N and writes:
+//    result[i] = SiLU(gate[i]) * up[i]
+
+const SHADER_SILU_MUL = /* wgsl */ `
+
+struct Params {
+  n: u32,
+}
+
+@group(0) @binding(0) var<storage, read>       gate_vec:   array<f32>;
+@group(0) @binding(1) var<storage, read>       up_vec:     array<f32>;
+@group(0) @binding(2) var<storage, read_write> result_vec: array<f32>;
+@group(0) @binding(3) var<uniform>             params:     Params;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let idx = gid.x;
+  if (idx >= params.n) { return; }
+
+  let gate = gate_vec[idx];
+  let up   = up_vec[idx];
+
+  // SiLU (swish β=1): gate * σ(gate) = gate / (1 + exp(-gate))
+  let silu = gate / (1.0 + exp(-gate));
+
+  result_vec[idx] = silu * up;
+}
+`;
 
 // ════════════════════════════════════════════════
 // 6. WebGPU Initialisation
@@ -812,6 +848,359 @@ async function run2DKernelPacked(device, packedWeights, inputVec, M, K) {
 }
 
 // ════════════════════════════════════════════════
+// 8b. SiLU · Multiply Kernel – Pipeline, Buffers, Dispatch
+// ════════════════════════════════════════════════
+
+/**
+ * Run the SiLU·Mul element-wise kernel on the GPU.
+ *   result[i] = SiLU(gateData[i]) * upData[i]
+ *
+ * @param {GPUDevice}    device   – WebGPU device
+ * @param {Float32Array} gateData – gate_proj output (length n)
+ * @param {Float32Array} upData   – up_proj output   (length n)
+ * @param {number}       n        – vector length
+ * @returns {{ results: Float32Array, computeMs: number }}
+ */
+async function runSiLUMulKernel(device, gateData, upData, n) {
+  const setupT0 = performance.now();
+
+  // ── Buffers ──
+  const gateBuf = device.createBuffer({
+    label: "silu-gate",
+    size:  n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(gateBuf, 0, new Float32Array(gateData));
+
+  const upBuf = device.createBuffer({
+    label: "silu-up",
+    size:  n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(upBuf, 0, new Float32Array(upData));
+
+  const resultBuf = device.createBuffer({
+    label: "silu-result",
+    size:  n * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  const stagingBuf = device.createBuffer({
+    label: "silu-staging",
+    size:  n * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  const uniformBuf = device.createBuffer({
+    label: "silu-params",
+    size:  4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uniformBuf, 0, new Uint32Array([n]));
+
+  // ── Pipeline ──
+  const module = device.createShaderModule({ code: SHADER_SILU_MUL });
+  const bgl = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const pipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    compute: { module, entryPoint: "main" },
+  });
+  const bindGroup = device.createBindGroup({
+    layout: bgl,
+    entries: [
+      { binding: 0, resource: { buffer: gateBuf } },
+      { binding: 1, resource: { buffer: upBuf } },
+      { binding: 2, resource: { buffer: resultBuf } },
+      { binding: 3, resource: { buffer: uniformBuf } },
+    ],
+  });
+
+  const setupMs = performance.now() - setupT0;
+
+  // ── Dispatch ──
+  const computeT0 = performance.now();
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(n / WORKGROUP_SIZE));
+  pass.end();
+  encoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, n * 4);
+  device.queue.submit([encoder.finish()]);
+
+  await stagingBuf.mapAsync(GPUMapMode.READ);
+  const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
+  stagingBuf.unmap();
+
+  const computeMs = performance.now() - computeT0;
+
+  [gateBuf, upBuf, resultBuf, stagingBuf, uniformBuf].forEach((b) =>
+    b.destroy(),
+  );
+  return { results, setupMs, computeMs };
+}
+
+// ════════════════════════════════════════════════
+// 8c. Unified Full MLP – Zero-Copy GPU Pipeline
+// ════════════════════════════════════════════════
+//
+// Runs the entire SwiGLU MLP block in a SINGLE command encoder
+// submission.  All intermediate tensors stay in VRAM — no CPU
+// round-trips until the final result is read back.
+//
+//   Pass 1: gate_out  = gate_proj  × input   (M_mid × K_in → M_mid)
+//   Pass 2: up_out    = up_proj    × input   (M_mid × K_in → M_mid)
+//   Pass 3: silu_out  = SiLU(gate_out) ⊙ up_out   (element-wise)
+//   Pass 4: result    = down_proj  × silu_out     (M_out × M_mid → M_out)
+//
+
+/**
+ * Run the full SwiGLU MLP block on the GPU with unified command encoding.
+ *
+ * @param {GPUDevice}    device      – WebGPU device
+ * @param {Uint32Array}  gateW       – packed gate_proj weights  (MLP_DIM × HIDDEN_DIM)
+ * @param {Uint32Array}  upW         – packed up_proj weights    (MLP_DIM × HIDDEN_DIM)
+ * @param {Uint32Array}  downW       – packed down_proj weights  (HIDDEN_DIM × MLP_DIM)
+ * @param {Float32Array} inputVec    – embedding vector (length HIDDEN_DIM)
+ * @param {number}       hiddenDim   – input/output dimension   (2560)
+ * @param {number}       mlpDim      – intermediate dimension   (6912)
+ * @returns {{ results: Float32Array, setupMs: number, computeMs: number }}
+ */
+async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim) {
+  const setupT0 = performance.now();
+
+  const gateStride = Math.ceil(hiddenDim / 16);  // gate/up: K = hiddenDim
+  const downStride = Math.ceil(mlpDim / 16);     // down:    K = mlpDim
+
+  // ── Shared input buffer (uploaded once) ─────────────────
+  const inputBuf = device.createBuffer({
+    label: "mlp-input",
+    size:  hiddenDim * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(inputBuf, 0, new Float32Array(inputVec));
+
+  // ── Weight buffers (uploaded once) ──────────────────────
+  const gateWeightBuf = device.createBuffer({
+    label: "mlp-gate-weights",
+    size:  gateW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(gateWeightBuf, 0, gateW);
+
+  const upWeightBuf = device.createBuffer({
+    label: "mlp-up-weights",
+    size:  upW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(upWeightBuf, 0, upW);
+
+  const downWeightBuf = device.createBuffer({
+    label: "mlp-down-weights",
+    size:  downW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(downWeightBuf, 0, downW);
+
+  // ── GPU-only intermediate buffers (never leave VRAM) ───
+  const gateOutBuf = device.createBuffer({
+    label: "mlp-gate-out",
+    size:  mlpDim * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const upOutBuf = device.createBuffer({
+    label: "mlp-up-out",
+    size:  mlpDim * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const siluOutBuf = device.createBuffer({
+    label: "mlp-silu-out",
+    size:  mlpDim * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+
+  // ── Final result + staging (only readback point) ───────
+  const resultBuf = device.createBuffer({
+    label: "mlp-result",
+    size:  hiddenDim * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const stagingBuf = device.createBuffer({
+    label: "mlp-staging",
+    size:  hiddenDim * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // ── Uniform buffers ────────────────────────────────────
+  //  gate/up params: M=mlpDim, K=hiddenDim, stride=gateStride
+  const gateUpUniform = device.createBuffer({
+    label: "mlp-gate-up-params",
+    size:  16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(
+    gateUpUniform, 0,
+    new Uint32Array([mlpDim, hiddenDim, gateStride, 0]),
+  );
+
+  //  SiLU·mul params: n=mlpDim
+  const siluUniform = device.createBuffer({
+    label: "mlp-silu-params",
+    size:  4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(siluUniform, 0, new Uint32Array([mlpDim]));
+
+  //  down params: M=hiddenDim, K=mlpDim, stride=downStride
+  const downUniform = device.createBuffer({
+    label: "mlp-down-params",
+    size:  16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(
+    downUniform, 0,
+    new Uint32Array([hiddenDim, mlpDim, downStride, 0]),
+  );
+
+  // ── Compile pipelines ──────────────────────────────────
+  const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
+  const siluModule = device.createShaderModule({ code: SHADER_SILU_MUL });
+
+  const matBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const matPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [matBGL] }),
+    compute: { module: matModule, entryPoint: "main" },
+  });
+
+  const siluBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const siluPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [siluBGL] }),
+    compute: { module: siluModule, entryPoint: "main" },
+  });
+
+  // ── Bind groups ────────────────────────────────────────
+  const gateBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: gateWeightBuf } },
+      { binding: 2, resource: { buffer: gateOutBuf } },
+      { binding: 3, resource: { buffer: gateUpUniform } },
+    ],
+  });
+
+  const upBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: upWeightBuf } },
+      { binding: 2, resource: { buffer: upOutBuf } },
+      { binding: 3, resource: { buffer: gateUpUniform } },  // same dims
+    ],
+  });
+
+  const siluBG = device.createBindGroup({
+    layout: siluBGL,
+    entries: [
+      { binding: 0, resource: { buffer: gateOutBuf } },
+      { binding: 1, resource: { buffer: upOutBuf } },
+      { binding: 2, resource: { buffer: siluOutBuf } },
+      { binding: 3, resource: { buffer: siluUniform } },
+    ],
+  });
+
+  const downBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: siluOutBuf } },
+      { binding: 1, resource: { buffer: downWeightBuf } },
+      { binding: 2, resource: { buffer: resultBuf } },
+      { binding: 3, resource: { buffer: downUniform } },
+    ],
+  });
+
+  const setupMs = performance.now() - setupT0;
+
+  // ═══════════════════════════════════════════════════════
+  //  SINGLE command encoder – all 4 passes, zero CPU trips
+  // ═══════════════════════════════════════════════════════
+  const computeT0 = performance.now();
+  const encoder = device.createCommandEncoder();
+
+  // Pass 1: gate_out = gate_proj × input
+  const pass1 = encoder.beginComputePass();
+  pass1.setPipeline(matPipeline);
+  pass1.setBindGroup(0, gateBG);
+  pass1.dispatchWorkgroups(mlpDim);
+  pass1.end();
+
+  // Pass 2: up_out = up_proj × input
+  const pass2 = encoder.beginComputePass();
+  pass2.setPipeline(matPipeline);
+  pass2.setBindGroup(0, upBG);
+  pass2.dispatchWorkgroups(mlpDim);
+  pass2.end();
+
+  // Pass 3: silu_out = SiLU(gate_out) ⊙ up_out
+  const pass3 = encoder.beginComputePass();
+  pass3.setPipeline(siluPipeline);
+  pass3.setBindGroup(0, siluBG);
+  pass3.dispatchWorkgroups(Math.ceil(mlpDim / WORKGROUP_SIZE));
+  pass3.end();
+
+  // Pass 4: result = down_proj × silu_out
+  const pass4 = encoder.beginComputePass();
+  pass4.setPipeline(matPipeline);
+  pass4.setBindGroup(0, downBG);
+  pass4.dispatchWorkgroups(hiddenDim);
+  pass4.end();
+
+  // Copy final result to staging (still inside the same encoder)
+  encoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, hiddenDim * 4);
+
+  // Submit everything as ONE command buffer
+  device.queue.submit([encoder.finish()]);
+
+  // Only NOW do we touch the CPU – single async readback
+  await stagingBuf.mapAsync(GPUMapMode.READ);
+  const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
+  stagingBuf.unmap();
+
+  const computeMs = performance.now() - computeT0;
+
+  // Cleanup
+  [
+    inputBuf, gateWeightBuf, upWeightBuf, downWeightBuf,
+    gateOutBuf, upOutBuf, siluOutBuf,
+    resultBuf, stagingBuf,
+    gateUpUniform, siluUniform, downUniform,
+  ].forEach((b) => b.destroy());
+
+  return { results, setupMs, computeMs };
+}
+
+// ════════════════════════════════════════════════
 // 9. Validation
 // ════════════════════════════════════════════════
 
@@ -1018,7 +1407,7 @@ async function main() {
   log("");
 
   // ─────────────────────────────────────────────
-  // TEST 3 – Real AI Weights Integration
+  // TEST 3 – Real AI Weights Integration (down_proj only – legacy)
   // ─────────────────────────────────────────────
 
   log(`━━━ Test 3: Real AI Weights – microsoft/bitnet-b1.58-2B-4T ━━━`);
@@ -1046,7 +1435,7 @@ async function main() {
     }
     log("");
 
-    // Store weights for interactive use
+    // Store weights for interactive use (legacy)
     realWeights = packedReal;
 
     // Create mock input vector (random floats in [-1, 1])
@@ -1101,6 +1490,62 @@ async function main() {
   log("");
 
   // ─────────────────────────────────────────────
+  // Load Full MLP Weights (gate_proj + up_proj + down_proj)
+  // ─────────────────────────────────────────────
+
+  log(`━━━ Loading Full SwiGLU MLP Weights (Layer 0) ━━━`);
+  log("");
+
+  try {
+    const mlpFiles = [
+      { name: "gate_proj", file: "bitnet_layer_0_gate_proj.bin", M: MLP_DIM, K: HIDDEN_DIM },
+      { name: "up_proj",   file: "bitnet_layer_0_up_proj.bin",   M: MLP_DIM, K: HIDDEN_DIM },
+      { name: "down_proj", file: "bitnet_layer_0_down_proj.bin", M: HIDDEN_DIM, K: MLP_DIM },
+    ];
+
+    const [gateResp, upResp, downResp] = await Promise.all(
+      mlpFiles.map(f => fetch(f.file)),
+    );
+    const responses = [gateResp, upResp, downResp];
+
+    for (let i = 0; i < mlpFiles.length; i++) {
+      if (!responses[i].ok) {
+        throw new Error(`${mlpFiles[i].file}: HTTP ${responses[i].status}`);
+      }
+    }
+
+    const [gateBuf, upBuf, downBuf] = await Promise.all(
+      responses.map(r => r.arrayBuffer()),
+    );
+
+    gateWeights = new Uint32Array(gateBuf);
+    upWeights   = new Uint32Array(upBuf);
+    downWeights = new Uint32Array(downBuf);
+
+    for (let i = 0; i < mlpFiles.length; i++) {
+      const w = [gateWeights, upWeights, downWeights][i];
+      const { name, M: mRows, K: kCols } = mlpFiles[i];
+      const stride = Math.ceil(kCols / 16);
+      const expected = mRows * stride;
+      log(`  ${name}: ${w.length.toLocaleString()} u32 (${(w.byteLength / 1024).toFixed(1)} KB)` +
+          ` — ${mRows}×${kCols}, stride ${stride}`, "info");
+      if (w.length !== expected) {
+        throw new Error(`${name} size mismatch: got ${w.length}, expected ${expected}`);
+      }
+    }
+
+    log("");
+    log("  ✅ All MLP weights loaded – SwiGLU pipeline ready", "pass");
+  } catch (err) {
+    log(`  ❌ FAIL – Could not load MLP weights: ${err.message}`, "fail");
+    log(`     Run: python extract_full_mlp.py  to generate all .bin files`, "info");
+    gateWeights = null;
+    upWeights   = null;
+    downWeights = null;
+  }
+  log("");
+
+  // ─────────────────────────────────────────────
   // Summary
   // ─────────────────────────────────────────────
 
@@ -1117,8 +1562,8 @@ async function main() {
   gpuDevice = device;
   log("");
 
-  if (realWeights) {
-    log("✔ Interactive mode ready – type text above and click Compute!", "pass");
+  if (gateWeights && upWeights && downWeights) {
+    log("✔ Interactive mode ready (full SwiGLU MLP) – type text above and click Compute!", "pass");
     const inputEl = document.getElementById("user-text");
     const btnEl   = document.getElementById("compute-btn");
     if (inputEl) inputEl.disabled = false;
@@ -1143,9 +1588,10 @@ async function main() {
 
 /**
  * Called when the user clicks "Compute" (or presses Enter).
- * Tokenizes the input text, builds a mock embedding seeded by
- * the last token ID, runs it through the real BitNet weight
- * matrix on the GPU, and displays the results.
+ *
+ * Full SwiGLU MLP pipeline (Layer 0) – unified GPU orchestration:
+ *   All 4 compute passes run in a SINGLE command encoder submission.
+ *   Intermediate tensors never leave VRAM.
  */
 async function onComputeClick() {
   const inputEl  = document.getElementById("user-text");
@@ -1170,29 +1616,35 @@ async function onComputeClick() {
   };
 
   try {
-    // 1. Tokenize → real embedding (zero-padded to REAL_K)
-    const embedding = getRealEmbedding(text, REAL_K);
+    // 1. Tokenize → real embedding (2560 dims, no padding)
+    const emb = getRealEmbedding(text);
 
-    // 2. Run through real BitNet weights on the GPU
-    const {
-      results,
-      computeMs,
-    } = await run2DKernelPacked(gpuDevice, realWeights, embedding, REAL_M, REAL_K);
+    // 2. Run full SwiGLU MLP in a single GPU submission
+    const { results, setupMs, computeMs } = await runFullMLP(
+      gpuDevice, gateWeights, upWeights, downWeights,
+      emb, HIDDEN_DIM, MLP_DIM,
+    );
 
     // 3. Display results
     outEl.textContent = "";
     ilog(`Input : "${text}"`);
-    ilog(`GPU compute time : ${computeMs.toFixed(3)} ms`, "info");
     ilog("");
+    ilog(`SwiGLU MLP Pipeline (Layer 0) – Unified GPU:`, "info");
+    ilog(`  Setup (buffers + pipelines) : ${setupMs.toFixed(3)} ms`, "info");
+    ilog(`  Compute (submit + readback) : ${computeMs.toFixed(3)} ms`, "info");
+    ilog(`  ─────────────────────────────────────`);
+    ilog(`  Total                       : ${(setupMs + computeMs).toFixed(3)} ms`, "info");
+    ilog("");
+
+    // Show last 10 values of final output (2560-dim vector)
+    const startIdx = results.length - 10;
     ilog("┌───────┬──────────────────┐");
-    ilog("│  Row  │    GPU Output     │");
+    ilog("│  Idx  │    GPU Output     │");
     ilog("├───────┼──────────────────┤");
-    const ROWS = Math.min(10, results.length);
-    for (let i = 0; i < ROWS; i++) {
+    for (let i = startIdx; i < results.length; i++) {
       const val = results[i].toFixed(6).padStart(16);
       ilog(`│ ${String(i).padStart(5)} │ ${val} │`);
     }
-    if (results.length > ROWS) ilog("│  ...  │       ...        │");
     ilog("└───────┴──────────────────┘");
   } catch (err) {
     ilog(`❌ Error: ${err.message}`, "fail");
