@@ -5,3 +5,7 @@ node_modules/
 *.log
 /dist
 /coverage
+
+# Old full-vocab embedding artifacts (superseded by sparse_embeddings.bin)
+bitnet_embed_tokens.bin
+bitnet_embed_tokens_10k.bin
