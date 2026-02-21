@@ -26,6 +26,13 @@ By replacing complex multiplication with simple addition and subtraction directl
 - [x] Browser Cache API (`fetchWithCache`) for instant repeat tokenizer loads
 - [x] Real embedding layer — sparse FP16 vocab slice (16,385 tokens, 80 MB)
 - [x] Mobile-optimised: iPhone / iPad / MacBook all load and run successfully
+- [x] Full SwiGLU MLP block — gate_proj + up_proj + SiLU·mul + down_proj (52.7M ternary params)
+- [x] SiLU activation WGSL compute shader for SwiGLU fusion
+- [x] Unified GPU orchestration — single command encoder, zero CPU round-trips
+- [x] Cross-device bit-exact determinism verified (M2 Max / M3 iPad / A16 iPhone)
+- [ ] LM Head — map MLP output to vocabulary logits
+- [ ] RMSNorm — proper layer normalization
+- [ ] Attention block
 - [ ] Multi-layer inference pipeline
 
 ## How It Works
@@ -93,22 +100,49 @@ dense row indices in the binary file.
 
 At runtime, the browser fetches both files in parallel. A lightweight
 `fp16ToNumber()` function converts each half-precision value to a
-standard JavaScript number. The 2,560-dimensional embedding is then
-zero-padded to 6,912 (the GPU kernel's input width) before dispatch.
+standard JavaScript number. The raw 2,560-dimensional embedding is
+passed directly into the MLP pipeline.
 
 Tokens outside the 16K subset gracefully fall back to row 0 (OOV).
 
 **Pipeline:** text → tokenizer → vocab map lookup → FP16→F32 conversion →
-zero-pad → GPU ternary mat-vec → output
+GPU SwiGLU MLP → output
+
+### Full SwiGLU MLP block (v0.5.0)
+
+The complete SwiGLU Multi-Layer Perceptron block for Layer 0:
+
+```
+embedding(2560) → gate_proj(6912) ─→ SiLU·mul(6912) → down_proj(2560)
+                → up_proj(6912)   ─┘
+```
+
+Three ternary weight matrices are extracted via `extract_full_mlp.py`,
+bit-packed (16 weights per `u32`), and served as static `.bin` files:
+- **gate_proj** — 6912×2560 (4,320 KB)
+- **up_proj** — 6912×2560 (4,320 KB)
+- **down_proj** — 2560×6912 (4,320 KB)
+
+### Unified GPU orchestration (v0.5.0)
+
+All four compute passes (gate matmul, up matmul, SiLU·multiply, down
+matmul) execute in a **single WebGPU command encoder submission**.
+Intermediate tensors (`gate_out`, `up_out`, `silu_out`) are GPU-only
+buffers that never leave VRAM — eliminating the GPU↔CPU "ping-pong"
+that previously added ~35ms of transfer latency per step.
+
+**Before (separate submissions):** 55.1ms
+**After (unified):** 7.2ms on M2 Max
 
 ### Real AI weight integration
 
-The `extract_weights.py` script downloads pre-trained weights from
+The `extract_full_mlp.py` script downloads pre-trained weights from
 [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
 on Hugging Face. The model stores weights as row-packed `uint8` tensors
-(4 ternary values per byte). The script unpacks these, then re-packs into
-our kernel's column-packed `uint32` format (16 weights per `u32`) and saves
-a binary `.bin` file that the browser can `fetch()` directly into GPU buffers.
+(4 ternary values per byte). The script unpacks all three MLP matrices
+(gate_proj, up_proj, down_proj), then re-packs into our kernel's
+column-packed `uint32` format (16 weights per `u32`) and saves `.bin`
+files that the browser can `fetch()` directly into GPU buffers.
 
 ## Quick Start
 
@@ -136,16 +170,16 @@ To reproduce the real-weight integration (Test 3), you need Python 3.10+ and (op
    pip install torch safetensors huggingface-hub numpy
    ```
 
-2. **Run the weight extraction script**
+2. **Run the full MLP weight extraction script**
    ```bash
-   python extract_weights.py
+   python extract_full_mlp.py
    ```
    This will:
    - Download `microsoft/bitnet-b1.58-2B-4T` (~1.1 GB safetensors file)
-   - Extract `model.layers.0.mlp.down_proj.weight` (2560 × 6912 ternary matrix)
+   - Extract all 3 Layer 0 MLP matrices: gate_proj (6912×2560), up_proj (6912×2560), down_proj (2560×6912)
    - Unpack the HF row-packed `uint8` format (4 weights/byte)
    - Re-pack into our JS kernel's column-packed `uint32` format (16 weights/u32)
-   - Save `bitnet_layer_0_down_proj.bin` (4.2 MB)
+   - Save `bitnet_layer_0_gate_proj.bin`, `bitnet_layer_0_up_proj.bin`, `bitnet_layer_0_down_proj.bin` (~4.3 MB each)
 
 3. **Run the sparse embedding extraction script**
    ```bash
@@ -185,33 +219,43 @@ Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
 | Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
 | Result | ✅ PASS | ✅ PASS | ✅ PASS |
 
-### Interactive mode: real embeddings → GPU mat-vec (v0.4.0)
+### Interactive mode: Full SwiGLU MLP pipeline (v0.5.0)
 
-Input run through the full pipeline: `@huggingface/tokenizers` encode → sparse FP16 vocab lookup → FP16→F32 conversion → zero-pad to 6912 → real BitNet weight matrix on GPU.
+Input run through the complete SwiGLU pipeline: `@huggingface/tokenizers` encode → sparse FP16 vocab lookup → FP16→F32 conversion → unified GPU SwiGLU MLP (gate_proj → up_proj → SiLU·mul → down_proj).
 
-**"Hello"** (1 token, ID 9906)
+**"Hello"** (1 token, ID 9906) — 52.7M ternary parameters, 4 compute passes
 
 | Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
 |--------|-------------------|-------------|----------------|
-| GPU compute | 27.0 ms | 10.0 ms | 6.3 ms |
-| output[0] | 22.507725 | 22.507725 | 22.507725 |
-| output[1] | 33.629837 | 33.629837 | 33.629837 |
+| 1st run (cold JIT) | 378 ms | 361 ms | 21.2 ms |
+| 2nd run | 68 ms | 30 ms | 16.2 ms |
+| Warmed (3rd/4th) | **38 ms** | **18 ms** | **7.2 ms** |
+| output[2559] | -106371.250000 | -106371.250000 | -106371.250000 |
 | Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
 
-**Asset load times** (sparse_embeddings.bin 80 MB + bitnet_layer_0_down_proj.bin 4.2 MB):
+**Warmed cache breakdown:**
 
 | | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
 |---|---|---|---|
-| Load time | ~15 s | ~12 s | ~12 s |
+| Setup (buffers + pipelines) | 9.0 ms | 2.0 ms | 0.8 ms |
+| Compute (submit + readback) | 29.0 ms | 16.0 ms | 6.4 ms |
+
+**Asset load times** (sparse_embeddings.bin 80 MB + 3× MLP .bin files ~13 MB):
+
+| | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
+|---|---|---|---|
+| First load | ~12 s | ~10 s | ~10 s |
+| Cached (304) | < 2 s | < 2 s | < 1 s |
 
 **Key takeaways:**
 
-- **Real semantic embeddings.** The system looks up the actual 2,560-dimensional vector that Microsoft's AI uses to represent "Hello", not random numbers.
+- **Complete SwiGLU MLP block.** The full gate_proj + up_proj + SiLU·mul + down_proj pipeline runs with real ternary weights from `microsoft/bitnet-b1.58-2B-4T`.
+- **Unified GPU orchestration.** All 4 compute passes run in a single command encoder submission — intermediate tensors never leave VRAM. This eliminated ~35ms of GPU↔CPU transfer latency.
+- **Metal JIT compilation.** First-run times (350ms+ on mobile) are entirely shader compilation. Apple's Metal backend caches the compiled GPU code — subsequent runs drop to steady-state speeds.
 - **Cross-device determinism.** All output values match to 6 decimal places across iPhone (A16), iPad (M3), and MacBook (M2 Max). The branchless, bit-packed kernel produces identical IEEE 754 results regardless of GPU architecture.
 - **Mobile-friendly.** FP16 sparse vocab slice (80 MB) loads cleanly on all devices — previously the 1.3 GB Float32 file crashed iOS Safari.
-- **FP16 precision is lossless for embeddings.** Output values are identical between the F32 and FP16 approaches, confirming the BitNet spec's guidance that boundary layers tolerate 16-bit precision.
-- **M2 Max dominates on compute** at 6.3 ms, benefiting from its 30-core GPU and 400 GB/s memory bandwidth.
-- **iPhone processes 17.7M ternary parameters in 27 ms** — well within interactive latency.
+- **M2 Max processes 52.7M ternary parameters in 7.2ms** — ~140 MLP blocks/second.
+- **iPhone processes the same in 38ms** — well within interactive latency for a phone.
 
 ## Project Structure
 
@@ -219,9 +263,12 @@ Input run through the full pipeline: `@huggingface/tokenizers` encode → sparse
 |------|-------------|
 | `index.html` | Page with interactive text input panel and automated test log |
 | `bitnet-kernel.js` | WebGPU setup, WGSL shaders, tokenizer integration, FP16 embedding loader, interactive handler, and validation |
-| `extract_weights.py` | Python script to extract and bit-pack ternary weights from Hugging Face |
+| `extract_weights.py` | Python script to extract and bit-pack ternary weights from Hugging Face (single layer) |
+| `extract_full_mlp.py` | Python script to extract & pack all 3 MLP weight matrices (gate, up, down) |
 | `extract_sparse_embeddings.py` | Python script to extract sparse FP16 embedding vocab slice + vocab map |
-| `bitnet_layer_0_down_proj.bin` | Pre-packed ternary weight binary for down_proj layer (generated by `extract_weights.py`) |
+| `bitnet_layer_0_gate_proj.bin` | Pre-packed ternary weight binary for gate_proj (generated by `extract_full_mlp.py`) |
+| `bitnet_layer_0_up_proj.bin` | Pre-packed ternary weight binary for up_proj (generated by `extract_full_mlp.py`) |
+| `bitnet_layer_0_down_proj.bin` | Pre-packed ternary weight binary for down_proj (generated by `extract_full_mlp.py`) |
 | `sparse_embeddings.bin` | FP16 embedding dictionary — 16,385 rows × 2,560 dims (generated by `extract_sparse_embeddings.py`) |
 | `vocab_map.json` | Token ID → dense row index mapping (generated by `extract_sparse_embeddings.py`) |
 | `package.json` | Project metadata |
