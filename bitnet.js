@@ -1,5 +1,5 @@
 /**
- * bitnet.js  –  v0.11.0
+ * bitnet.js  –  v0.11.1
  *
  * BitNet b1.58-2B-4T WebGPU inference engine with:
  *
@@ -37,7 +37,7 @@
  *   neg_val  = bitcast<f32>(bitcast<u32>(inp) & mask_neg)
  *   result   = pos_val − neg_val
  *
- * API (v0.11.0 – Object-Oriented)
+ * API (v0.11.1 – Object-Oriented)
  * ────────────────────────────────
  *   const engine = new BitNetEngine();
  *   await engine.init();                           // load weights & WebGPU
@@ -2256,7 +2256,7 @@ async function main() {
   if (el) el.textContent = "";
 
   log("╔════════════════════════════════════════════════════════╗");
-  log("║  bitnet.js – v0.11.0                                   ║");
+  log("║  bitnet.js – v0.11.1                                   ║");
   log("║  BitNet b1.58 · WebGPU · Bit-Packed · Branchless       ║");
   log("╚════════════════════════════════════════════════════════╝");
   log("");

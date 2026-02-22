@@ -1,4 +1,4 @@
-# BitNet WebGPU
+# bitnet.js
 
 Run Microsoft's [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) (2 billion parameter, 1.58-bit ternary) large language model **entirely in the browser** using WebGPU — no server, no Python runtime, no WASM. Just JavaScript, WGSL shaders, and your GPU.
 
@@ -6,7 +6,7 @@ Run Microsoft's [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.
 
 Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which creates a massive memory bottleneck. BitNet replaces those multiplications with ternary weights (-1, 0, +1), turning every matrix–vector product into pure addition and subtraction. This project implements that idea end-to-end in WGSL compute shaders, making a 2B-parameter LLM runnable in a single browser tab.
 
-## Current Status — v0.11.0
+## Current Status — v0.11.1
 
 The engine produces **coherent, grammatically correct English** through all 30 transformer layers. This is a full autoregressive inference engine — not a demo, not a single-layer proof.
 
@@ -138,8 +138,8 @@ Uses the **Llama-style `rotate_half`** convention: dimension `d` is paired with 
 
 1. **Clone the repo**
    ```bash
-   git clone https://github.com/qwatts-dev/bitnet-webgpu-poc.git
-   cd bitnet-webgpu-poc
+   git clone https://github.com/qwatts-dev/bitnet.js.git
+   cd bitnet.js
    ```
 
 2. **Extract model weights** (requires Python 3.10+, ~660 MB disk space)
