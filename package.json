@@ -1,6 +1,6 @@
 {
   "name": "bitnet.js",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Run Microsoft's BitNet b1.58-2B-4T (2B parameter, 1.58-bit ternary) large language model entirely in the browser using WebGPU.",
   "main": "bitnet.js",
   "scripts": {
@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/qwatts-dev/bitnet-webgpu-poc.git"
+    "url": "git+https://github.com/qwatts-dev/bitnet.js.git"
   },
   "keywords": [
     "webgpu",
@@ -24,7 +24,7 @@
   "license": "MIT",
   "type": "module",
   "bugs": {
-    "url": "https://github.com/qwatts-dev/bitnet-webgpu-poc/issues"
+    "url": "https://github.com/qwatts-dev/bitnet.js/issues"
   },
-  "homepage": "https://github.com/qwatts-dev/bitnet-webgpu-poc#readme"
+  "homepage": "https://github.com/qwatts-dev/bitnet.js#readme"
 }
