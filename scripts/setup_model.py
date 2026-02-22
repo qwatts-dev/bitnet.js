@@ -35,7 +35,7 @@ def run():
     ]
 
     print("=" * 70)
-    print("  BitNet WebGPU – Full Model Setup")
+    print("  bitnet.js – Full Model Setup")
     print("=" * 70)
     print(f"  Working directory : {os.getcwd()}")
     print(f"  Steps             : {len(steps)}")
