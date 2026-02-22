@@ -1,7 +1,7 @@
 /**
- * bitnet-kernel.js  –  v0.11.0
+ * bitnet.js  –  v0.11.0
  *
- * Hardware-optimised BitNet 1.58-bit WebGPU kernel with:
+ * BitNet b1.58-2B-4T WebGPU inference engine with:
  *
  *   1. Bit-Packed Weights  – 16 ternary values per u32 (2 bits each),
  *      reducing weight-buffer memory by 16×.
@@ -46,8 +46,8 @@
  *
  * Usage
  * ─────
- *   Browser  : <script type="module" src="bitnet-kernel.js">
- *   Node ≥ 22: node --experimental-webgpu bitnet-kernel.js
+ *   Browser  : <script type="module" src="bitnet.js">
+ *   Node ≥ 22: node --experimental-webgpu bitnet.js
  */
 
 // ════════════════════════════════════════════════
@@ -1703,8 +1703,8 @@ export class BitNetEngine {
    */
   async init(weightsPath = 'weights') {
     await this._initTokenizer();
-    await this._loadEmbeddings();
-    await this._loadLMHead();
+    await this._loadEmbeddings(weightsPath);
+    await this._loadLMHead(weightsPath);
 
     this.device = await this._initWebGPU();
     log("✔ WebGPU device acquired", "info");
@@ -2040,12 +2040,12 @@ export class BitNetEngine {
   /**
    * Load sparse FP16 embeddings + vocab map.
    */
-  async _loadEmbeddings() {
+  async _loadEmbeddings(weightsPath = 'weights') {
     log('Loading sparse embeddings (FP16) …', 'info');
 
     const [mapResp, binResp] = await Promise.all([
-      fetch('vocab_map.json'),
-      fetch('sparse_embeddings.bin'),
+      fetch(`${weightsPath}/vocab_map.json`),
+      fetch(`${weightsPath}/sparse_embeddings.bin`),
     ]);
     if (!mapResp.ok) throw new Error(`vocab_map.json fetch failed: HTTP ${mapResp.status}`);
     if (!binResp.ok) throw new Error(`sparse_embeddings.bin fetch failed: HTTP ${binResp.status}`);
@@ -2066,10 +2066,10 @@ export class BitNetEngine {
   /**
    * Load sparse FP16 LM head weights and decode to Float32.
    */
-  async _loadLMHead() {
+  async _loadLMHead(weightsPath = 'weights') {
     log('Loading sparse LM head (FP16) …', 'info');
 
-    const resp = await fetch('sparse_lm_head.bin');
+    const resp = await fetch(`${weightsPath}/sparse_lm_head.bin`);
     if (!resp.ok) throw new Error(`sparse_lm_head.bin fetch failed: HTTP ${resp.status}`);
     const buf = await resp.arrayBuffer();
     const fp16 = new Uint16Array(buf);
@@ -2256,8 +2256,8 @@ async function main() {
   if (el) el.textContent = "";
 
   log("╔════════════════════════════════════════════════════════╗");
-  log("║  BitNet 1.58-bit WebGPU Kernel – v0.11.0 (OOP)        ║");
-  log("║  Bit-Packed · Branchless · Tiled                       ║");
+  log("║  bitnet.js – v0.11.0                                   ║");
+  log("║  BitNet b1.58 · WebGPU · Bit-Packed · Branchless       ║");
   log("╚════════════════════════════════════════════════════════╝");
   log("");
 
@@ -2266,8 +2266,8 @@ async function main() {
 
   // ── Tokenizer + Embeddings + LM Head ──
   await engine._initTokenizer();
-  await engine._loadEmbeddings();
-  await engine._loadLMHead();
+  await engine._loadEmbeddings('weights');
+  await engine._loadLMHead('weights');
 
   const device = await engine._initWebGPU();
   engine.device = device;

@@ -25,6 +25,7 @@ Usage:
 """
 
 import json
+import os
 import numpy as np
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
@@ -33,6 +34,7 @@ from safetensors.torch import load_file
 CONTIGUOUS_SLICE = 16384       # first N tokens (frequency-ordered by BPE)
 EXTRA_TOKEN_IDS  = [50991]     # "WebGPU" and any other specific tokens
 MODEL_NAME       = "microsoft/bitnet-b1.58-2B-4T"
+OUTPUT_DIR       = "weights"
 
 
 def main():
@@ -110,14 +112,15 @@ def main():
     # ── 5. Save output files ──────────────────────────────────
     print(f"\n[5/5] Saving output files ...")
 
-    bin_file = "sparse_embeddings.bin"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    bin_file = os.path.join(OUTPUT_DIR, "sparse_embeddings.bin")
     subset.tofile(bin_file)
     print(f"      {bin_file}: {subset.nbytes:,} bytes ({subset.nbytes / 1024 / 1024:.1f} MB)")
 
-    map_file = "vocab_map.json"
+    map_file = os.path.join(OUTPUT_DIR, "vocab_map.json")
     with open(map_file, "w") as f:
         json.dump(vocab_map, f, separators=(",", ":"))
-    import os
     map_size = os.path.getsize(map_file)
     print(f"      {map_file}: {map_size:,} bytes ({map_size / 1024:.1f} KB)")
 
