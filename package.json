@@ -1,11 +1,11 @@
 {
-  "name": "bitnet-webgpu-poc",
-  "version": "0.10.0",
-  "description": "An experimental proof-of-concept aimed at running 1-bit AI models (like Microsoft's BitNet b1.58) natively in JavaScript using WebGPU.",
-  "main": "bitnet-kernel.js",
+  "name": "bitnet.js",
+  "version": "0.11.0",
+  "description": "Run Microsoft's BitNet b1.58-2B-4T (2B parameter, 1.58-bit ternary) large language model entirely in the browser using WebGPU.",
+  "main": "bitnet.js",
   "scripts": {
-    "start": "node --experimental-webgpu bitnet-kernel.js",
-    "test": "node --experimental-webgpu bitnet-kernel.js"
+    "start": "npx serve . -l 8080",
+    "setup": "python scripts/setup_model.py"
   },
   "repository": {
     "type": "git",
@@ -17,11 +17,11 @@
     "1-bit",
     "ternary-weights",
     "gpu-compute",
-    "transformers.js",
-    "tokenizer"
+    "huggingface-tokenizers",
+    "llm"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "type": "module",
   "bugs": {
     "url": "https://github.com/qwatts-dev/bitnet-webgpu-poc/issues"

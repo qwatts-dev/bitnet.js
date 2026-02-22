@@ -18,6 +18,7 @@ Usage:
   python extract_lm_head.py
 """
 
+import os
 import numpy as np
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
@@ -28,6 +29,7 @@ CONTIGUOUS_SLICE = 16384       # first N tokens (same as embeddings)
 EXTRA_TOKEN_IDS  = [50991]     # "WebGPU" token
 MODEL_NAME       = "microsoft/bitnet-b1.58-2B-4T"
 EXPECTED_HIDDEN  = 2560        # hidden_size
+OUTPUT_DIR       = "weights"
 
 
 def main():
@@ -102,11 +104,12 @@ def main():
         print("      WARNING: NaN/Inf detected in LM head weights!")
 
     # ── 5. Save output ─────────────────────────────────────────
-    out_file = "sparse_lm_head.bin"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    out_file = os.path.join(OUTPUT_DIR, "sparse_lm_head.bin")
     print(f"\n[5/5] Saving to {out_file} ...")
     subset.tofile(out_file)
 
-    import os
     file_size = os.path.getsize(out_file)
     print(f"      File size: {file_size:,} bytes ({file_size / 1024 / 1024:.1f} MB)")
 
