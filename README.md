@@ -1,44 +1,31 @@
-# BitNet WebGPU PoC
+# BitNet WebGPU
 
-An experimental proof-of-concept that runs Microsoft's [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) (2 billion parameter, 1.58-bit ternary) large language model **entirely in the browser** using WebGPU — no server, no Python runtime, no WASM. Just JavaScript, WGSL shaders, and your GPU.
+Run Microsoft's [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) (2 billion parameter, 1.58-bit ternary) large language model **entirely in the browser** using WebGPU — no server, no Python runtime, no WASM. Just JavaScript, WGSL shaders, and your GPU.
 
-## The Goal
-Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which creates a massive memory bottleneck. This PoC rewrites the core mathematical kernels in WGSL (WebGPU Shading Language) to use ternary weights (-1, 0, 1).
+## Why?
 
-By replacing complex multiplication with simple addition and subtraction directly on the GPU, we drastically reduce memory bandwidth and make running a 2B-parameter LLM in the browser a reality.
+Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which creates a massive memory bottleneck. BitNet replaces those multiplications with ternary weights (-1, 0, +1), turning every matrix–vector product into pure addition and subtraction. This project implements that idea end-to-end in WGSL compute shaders, making a 2B-parameter LLM runnable in a single browser tab.
 
-## Current Status — v0.10.0: Coherent Text Generation
+## Current Status — v0.11.0
 
 The engine produces **coherent, grammatically correct English** through all 30 transformer layers. This is a full autoregressive inference engine — not a demo, not a single-layer proof.
 
-**Sample outputs** (prompt: "Hello"):
-> *Hello, my name is [Your Name], and I am a student here at your school. We are*
+**Sample outputs:**
 
-> *Hello, welcome to the real world. I'm sorry if you're feeling lost." The customer looked around*
+> **Prompt:** *The capital city of France is*
+> **Output:** *Paris, and the capital of Italy is... 3. What are some factors to consider when looking for*
 
-**Performance:** ~191 ms/token on MacBook (M-series Apple Silicon)
+> **Prompt:** *Hello*
+> **Output:** *Hello, my name is [Your Name], and I am a student here at your school. We are*
 
-### Milestone Checklist
-- [x] WebGPU environment + WGSL compute shaders for ternary math
-- [x] Bit-packed weights (16 ternary values per `u32`) with branchless arithmetic
-- [x] 2D tiled mat-vec kernel using `var<workgroup>` shared memory
-- [x] Real AI weights from Hugging Face (`microsoft/bitnet-b1.58-2B-4T`)
-- [x] Tokenizer via standalone [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) (~8.3 kB gzipped)
-- [x] Browser Cache API for instant repeat tokenizer loads
-- [x] Sparse FP16 embedding layer (16,385 tokens, 80 MB)
-- [x] Full ReLU²-gated MLP block — gate_proj + up_proj + ReLU²·mul + down_proj
-- [x] Unified GPU orchestration — single command encoder, zero CPU round-trips
-- [x] LM Head — dense FP16 mat-vec with tied embeddings (16,385 × 2,560)
-- [x] RMSNorm — CPU-side with learned γ weights (eps=1e-5)
-- [x] Self-Attention — RoPE (Llama-style rotate_half) + GQA (20 Q / 5 KV heads)
-- [x] KV cache — incremental key/value storage (MAX_SEQ_LEN=128)
-- [x] **Full 30-layer transformer** with correct residual connections
-- [x] **SubLN** — RMSNorm sub-norms after attention and after MLP activation (before O-proj and down-proj)
-- [x] **BitLinear weight_scale** — per-projection scalar multipliers from model config
-- [x] **Correct HF bit-packing** — contiguous-block row layout with `value+1` encoding
-- [x] Autoregressive generation with streaming token output
-- [x] LLM sampling — Temperature + Top-K + Top-P (nucleus) + frequency-scaled repetition penalty
-- [x] **Coherent multi-sentence English output**
+### What's in the box
+
+- `export class BitNetEngine` — clean OOP API: `init()`, `generate()`, `reset()`
+- Bit-packed ternary weights (16 values per `u32`) with branchless arithmetic
+- 2D tiled mat-vec kernel using `var<workgroup>` shared memory
+- Full 30-layer transformer: RoPE + GQA attention, SwiGLU MLP with ReLU², SubLN, BitLinear weight scales
+- Streaming autoregressive generation with Temperature + Top-K + Top-P + repetition penalty
+- One-command model setup: `python scripts/setup_model.py`
 
 ## Architecture
 
@@ -155,33 +142,25 @@ Uses the **Llama-style `rotate_half`** convention: dimension `d` is paired with 
    cd bitnet-webgpu-poc
    ```
 
-2. **Extract model weights** (requires Python 3.10+)
+2. **Extract model weights** (requires Python 3.10+, ~660 MB disk space)
    ```bash
    pip install torch safetensors huggingface-hub numpy accelerate transformers
+   npm run setup
    ```
 
-   Run the extraction scripts in order:
-   ```bash
-   python extract_sparse_embeddings.py   # Embeddings (80 MB)
-   python extract_lm_head.py             # LM Head (80 MB, tied weights)
-   python extract_all_layers.py          # All 30 layers (497 MB, 210 files)
-   python extract_rmsnorm.py             # RMSNorm weights (31 files)
-   python extract_sub_norms.py           # SubLN weights (60 files)
-   python extract_weight_scales.py       # Per-projection weight_scale values
-   ```
-
-   This produces:
-   - `sparse_embeddings.bin` + `vocab_map.json` — sparse FP16 embedding slice
+   This single command downloads the model from Hugging Face and writes everything into `weights/`:
+   - `vocab_map.json` — token ID → dense row index mapping
+   - `sparse_embeddings.bin` — FP16 embedding slice (16,385 × 2,560)
    - `sparse_lm_head.bin` — FP16 LM head (tied to embeddings)
-   - `weights/bitnet_layer_{i}_{proj}.bin` — 7 ternary weight files × 30 layers
-   - `weights/bitnet_layer_{i}_attn_norm.bin` + `_mlp_norm.bin` — learned RMSNorm γ
-   - `weights/bitnet_layer_{i}_attn_sub_norm.bin` + `_ffn_sub_norm.bin` — SubLN γ
-   - `weights/bitnet_layer_scales.json` — per-projection weight_scale values
-   - `weights/bitnet_final_norm.bin` — final layer RMSNorm γ
+   - `bitnet_layer_{i}_{proj}.bin` — 7 ternary weight files × 30 layers
+   - `bitnet_layer_{i}_attn_norm.bin` + `_mlp_norm.bin` — learned RMSNorm γ
+   - `bitnet_layer_{i}_attn_sub_norm.bin` + `_ffn_sub_norm.bin` — SubLN γ
+   - `bitnet_layer_scales.json` — per-projection weight_scale values
+   - `bitnet_final_norm.bin` — final layer RMSNorm γ
 
 3. **Start a local web server**
    ```bash
-   npx serve . -l 8080
+   npm start
    ```
 
 4. **Open in a WebGPU-capable browser** (Chrome 113+, Edge 113+, Safari 18+)
@@ -202,27 +181,41 @@ npx cloudflared tunnel --url http://localhost:8080
 
 Open the `https://...trycloudflare.com` URL on your mobile device.
 
+## Benchmarks
+
+| Device | Tokens/sec | Latency/token | Notes |
+|--------|-----------|---------------|-------|
+| MacBook Pro M2 Max | ~5 tok/s | ~200 ms | 20 tokens in ~4–5 s, 300 GPU dispatches/token |
+
+> Benchmarks are from autoregressive generation (not prefill). Each token requires 300 GPU compute dispatches across 30 transformer layers.
+
+## Testing
+
+The engine ships with 3 automated GPU validation tests (1D ternary kernel, 2D tiled mat-vec, real AI weight forward pass). See [docs/TESTING.md](docs/TESTING.md) for full details and expected outputs.
+
 ## Project Structure
 
-| File | Description |
+| Path | Description |
 |------|-------------|
 | `index.html` | Interactive UI — prompt input, streaming token output, sampling controls |
-| `bitnet-kernel.js` | Complete WebGPU inference engine — WGSL shaders, 30-layer transformer, tokenizer, generation loop |
-| **Extraction Scripts** | |
-| `extract_all_layers.py` | Main extractor — all 7 ternary weight matrices × 30 layers (210 files) |
-| `extract_rmsnorm.py` | RMSNorm learned γ weights (input_layernorm, post_attention_layernorm, final_norm) |
-| `extract_sub_norms.py` | SubLN γ weights (attn_sub_norm, ffn_sub_norm) |
-| `extract_weight_scales.py` | Per-projection weight_scale scalars from BitLinear layers |
-| `extract_sparse_embeddings.py` | Sparse FP16 embedding slice (16,385 of 128,256 tokens) + vocab map |
-| `extract_lm_head.py` | FP16 LM head (tied to embed_tokens) |
-| `extract_attention.py` | Single-layer attention weight extractor (legacy, superseded by `extract_all_layers.py`) |
-| `extract_full_mlp.py` | Single-layer MLP weight extractor (legacy, superseded by `extract_all_layers.py`) |
-| `extract_weights.py` | Single-matrix weight extractor (legacy, superseded by `extract_all_layers.py`) |
-| **Runtime Assets** *(gitignored — generated by extraction scripts)* | |
-| `sparse_embeddings.bin` | FP16 embeddings — 16,385 rows × 2,560 dims (80 MB) |
-| `vocab_map.json` | Token ID → dense row index mapping |
-| `sparse_lm_head.bin` | FP16 LM head — 16,385 rows × 2,560 dims (80 MB) |
-| `weights/` | 331 binary files — ternary weights, norms, sub-norms, scales (~500 MB total) |
+| `bitnet.js` | Complete WebGPU inference engine (`BitNetEngine` class) — WGSL shaders, 30-layer transformer, tokenizer, generation loop |
+| `docs/TESTING.md` | Test suite documentation — 3 automated GPU validation tests |
+| **`scripts/`** | **Python extraction scripts** |
+| `scripts/setup_model.py` | Master orchestrator — runs all extractors in sequence |
+| `scripts/extract_all_layers.py` | All 7 ternary weight matrices × 30 layers (210 files) |
+| `scripts/extract_rmsnorm.py` | RMSNorm learned γ (input_layernorm, post_attention_layernorm, final_norm) |
+| `scripts/extract_sub_norms.py` | SubLN γ (attn_sub_norm, ffn_sub_norm) |
+| `scripts/extract_weight_scales.py` | Per-projection weight_scale scalars from BitLinear layers |
+| `scripts/extract_sparse_embeddings.py` | Sparse FP16 embedding slice (16,385 tokens) + vocab map |
+| `scripts/extract_lm_head.py` | FP16 LM head (tied to embed_tokens) |
+| `scripts/extract_attention.py` | Single-layer attention extractor (legacy) |
+| `scripts/extract_full_mlp.py` | Single-layer MLP extractor (legacy) |
+| `scripts/extract_weights.py` | Single-matrix extractor (legacy) |
+| **`weights/`** | **Runtime assets** *(gitignored — generated by `setup_model.py`)* |
+| `weights/sparse_embeddings.bin` | FP16 embeddings — 16,385 × 2,560 (80 MB) |
+| `weights/vocab_map.json` | Token ID → dense row index mapping |
+| `weights/sparse_lm_head.bin` | FP16 LM head — 16,385 × 2,560 (80 MB) |
+| `weights/bitnet_layer_*.bin` | 331 binary files — ternary weights, norms, sub-norms, scales (~500 MB) |
 
 ## Key Technical Details
 
