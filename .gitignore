@@ -2,6 +2,7 @@ package-lock.json
 node_modules/
 .DS_Store
 .env
+.venv/
 *.log
 /dist
 /coverage
@@ -9,3 +10,9 @@ node_modules/
 # Old full-vocab embedding artifacts (superseded by sparse_embeddings.bin)
 bitnet_embed_tokens.bin
 bitnet_embed_tokens_10k.bin
+
+# Old root-level single-layer weight files (superseded by weights/ directory)
+bitnet_layer_0_*.bin
+
+# Extracted model weights (500+ MB — regenerate with extract_all_layers.py)
+weights/

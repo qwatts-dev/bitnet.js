@@ -52,19 +52,19 @@ import { Tokenizer } from 'https://cdn.jsdelivr.net/npm/@huggingface/tokenizers'
 let tokenizer      = null;
 let gpuDevice       = null;   // kept alive for interactive use
 let realWeights     = null;   // Uint32Array – packed down_proj (kept for Test 3 compat)
-let gateWeights     = null;   // Uint32Array – packed gate_proj (6912×2560)
-let upWeights       = null;   // Uint32Array – packed up_proj   (6912×2560)
-let downWeights     = null;   // Uint32Array – packed down_proj (2560×6912)
 let embeddingData   = null;   // Uint16Array – FP16 sparse embed_tokens
 let vocabMap        = null;   // Object – original token ID → dense row index
 let lmHeadWeights   = null;   // Float32Array – dense LM head (vocab-sliced)
 let reverseVocabMap = null;   // Object – dense row index → original token ID
-let qProjWeights    = null;   // Uint32Array – packed q_proj  (2560×2560)
-let kProjWeights    = null;   // Uint32Array – packed k_proj  (640×2560)
-let vProjWeights    = null;   // Uint32Array – packed v_proj  (640×2560)
-let oProjWeights    = null;   // Uint32Array – packed o_proj  (2560×2560)
-let kCacheBuf       = null;   // GPUBuffer – persistent KV cache (K)
-let vCacheBuf       = null;   // GPUBuffer – persistent KV cache (V)
+let finalNormWeights = null;  // Float32Array – learned RMSNorm weights for final norm
+let layerScales     = null;  // Object – { "0": { q_proj: 1.2, ... }, "1": {...}, ... }
+
+// ── 26 Transformer Layers ──
+// Each entry: { qW, kW, vW, oW, gateW, upW, downW, attnNorm, mlpNorm } (Uint32Array / Float32Array)
+const layers      = [];       // layers[0..25]
+const kCacheBufs  = [];       // GPUBuffer per layer – persistent KV cache (K)
+const vCacheBufs  = [];       // GPUBuffer per layer – persistent KV cache (V)
+
 let seqPos          = 0;      // current token position in sequence
 const HIDDEN_DIM    = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 const MLP_DIM       = 6912;   // intermediate_size (SwiGLU)
@@ -72,6 +72,7 @@ const REAL_M        = 2560;   // rows  (down_proj output dim) — kept for Test 
 const REAL_K        = 6912;   // cols  (down_proj input  dim) — kept for Test 3
 const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 const LM_HEAD_ROWS  = 16385;  // vocab-sliced rows (16384 + 1 for "WebGPU")
+const NUM_LAYERS    = 30;     // transformer layers
 
 // ── Self-Attention architecture constants ──
 const NUM_Q_HEADS    = 20;           // query heads
@@ -81,7 +82,7 @@ const GQA_GROUP_SIZE = NUM_Q_HEADS / NUM_KV_HEADS;  // 4
 const Q_DIM          = NUM_Q_HEADS  * HEAD_DIM;      // 2560
 const KV_DIM         = NUM_KV_HEADS * HEAD_DIM;      // 640
 const MAX_SEQ_LEN    = 128;          // max tokens in KV cache
-const ROPE_THETA     = 10000.0;      // RoPE base frequency
+const ROPE_THETA     = 500000.0;     // RoPE base frequency
 
 /**
  * Fetch a URL using the browser Cache API so repeated loads are instant.
@@ -195,6 +196,104 @@ async function loadLMHead() {
 }
 
 /**
+ * Load all 26 transformer layers from the weights/ directory.
+ * Each layer has 7 packed binary matrices:
+ *   q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+ *
+ * Loads layers sequentially (2 at a time) to avoid swamping the
+ * browser's maximum concurrent connection limit.
+ *
+ * Populates the global `layers` array with objects:
+ *   { qW, kW, vW, oW, gateW, upW, downW }
+ */
+async function loadAllLayers() {
+  log(`━━━ Loading All ${NUM_LAYERS} Transformer Layers (${NUM_LAYERS * 7} matrices) ━━━`);
+  log('');
+
+  const PROJ_NAMES = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'];
+  const t0 = performance.now();
+  let totalBytes = 0;
+
+  // Fetch weight scales JSON in parallel with first layer
+  const scalesResp = await fetch('weights/bitnet_layer_scales.json');
+  if (scalesResp.ok) {
+    layerScales = await scalesResp.json();
+    log(`  ✔ Weight scales loaded (${Object.keys(layerScales).length} layers)`, 'pass');
+  } else {
+    log(`  ⚠ bitnet_layer_scales.json not found – scales will default to 1.0`, 'fail');
+    layerScales = {};
+  }
+
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    const layerT0 = performance.now();
+
+    // Fetch all 7 ternary matrices + 2 RMSNorm vectors + 2 sub-norms for this layer in parallel
+    const projUrls = PROJ_NAMES.map(p => `weights/bitnet_layer_${i}_${p}.bin`);
+    const normUrls = [
+      `weights/bitnet_layer_${i}_attn_norm.bin`,
+      `weights/bitnet_layer_${i}_mlp_norm.bin`,
+      `weights/bitnet_layer_${i}_attn_sub_norm.bin`,
+      `weights/bitnet_layer_${i}_ffn_sub_norm.bin`,
+    ];
+    const urls = [...projUrls, ...normUrls];
+    const responses = await Promise.all(urls.map(u => fetch(u)));
+
+    // Validate all responses
+    for (let j = 0; j < responses.length; j++) {
+      if (!responses[j].ok) {
+        throw new Error(`${urls[j]}: HTTP ${responses[j].status}`);
+      }
+    }
+
+    // Parse all ArrayBuffers in parallel
+    const buffers = await Promise.all(responses.map(r => r.arrayBuffer()));
+
+    // Per-projection weight scales (default 1.0 if JSON missing)
+    const ls = (layerScales && layerScales[String(i)]) || {};
+
+    const layerWeights = {
+      qW:      new Uint32Array(buffers[0]),
+      kW:      new Uint32Array(buffers[1]),
+      vW:      new Uint32Array(buffers[2]),
+      oW:      new Uint32Array(buffers[3]),
+      gateW:   new Uint32Array(buffers[4]),
+      upW:     new Uint32Array(buffers[5]),
+      downW:   new Uint32Array(buffers[6]),
+      attnNorm:    new Float32Array(buffers[7]),   // learned input_layernorm γ
+      mlpNorm:     new Float32Array(buffers[8]),   // learned post_attention_layernorm γ
+      attnSubNorm: new Float32Array(buffers[9]),   // sub-norm between GQA out & o_proj (dim 2560)
+      ffnSubNorm:  new Float32Array(buffers[10]),  // sub-norm between ReLU²·mul & down_proj (dim 6912)
+      // BitLinear weight_scale per projection
+      qScale:    ls.q_proj    ?? 1.0,
+      kScale:    ls.k_proj    ?? 1.0,
+      vScale:    ls.v_proj    ?? 1.0,
+      oScale:    ls.o_proj    ?? 1.0,
+      gateScale: ls.gate_proj ?? 1.0,
+      upScale:   ls.up_proj   ?? 1.0,
+      downScale: ls.down_proj ?? 1.0,
+    };
+
+    let layerBytes = 0;
+    for (const buf of buffers) layerBytes += buf.byteLength;
+    totalBytes += layerBytes;
+
+    layers.push(layerWeights);
+
+    const layerMs = performance.now() - layerT0;
+    log(`  Layer ${String(i).padStart(2)}/25 loaded: ` +
+        `${(layerBytes / 1024 / 1024).toFixed(2)} MB  ` +
+        `(${layerMs.toFixed(0)} ms)`, 'info');
+  }
+
+  const elapsed = performance.now() - t0;
+  log('');
+  log(`  ✅ All ${NUM_LAYERS} layers loaded: ${layers.length * 7} matrices, ` +
+      `${(totalBytes / 1024 / 1024).toFixed(2)} MB total ` +
+      `(${(elapsed / 1000).toFixed(1)}s)`, 'pass');
+  log('');
+}
+
+/**
  * Initialise the Llama-3 tokenizer via the standalone
  * @huggingface/tokenizers package (~8.3 kB).
  * Downloads tokenizer.json + tokenizer_config.json from the
@@ -303,6 +402,7 @@ struct MatParams {
   M: u32,              // rows   (output length)
   K: u32,              // cols   (input  length)
   packed_stride: u32,  // u32s per packed row = ceil(K / 16)
+  weight_scale: f32,   // BitLinear per-projection scale factor
 }
 
 @group(0) @binding(0) var<storage, read>       input_vec:      array<f32>;
@@ -394,9 +494,10 @@ fn main(
     workgroupBarrier();
   }
 
-  // Thread 0 writes the final dot-product to the output.
+  // Thread 0 writes the final dot-product to the output,
+  // scaled by the BitLinear weight_scale factor.
   if (tid == 0u) {
-    output_vec[row] = shared_acc[0];
+    output_vec[row] = shared_acc[0] * params.weight_scale;
   }
 }
 `;
@@ -824,12 +925,13 @@ fn main(
 // ════════════════════════════════════════════════
 //
 //  SwiGLU(x) = SiLU(gate_proj(x)) ⊙ up_proj(x)
-//  SiLU(g)   = g / (1 + exp(-g))    (a.k.a. swish with β=1)
+//  ReLU²(g) = max(0, g)²
 //
-//  This shader takes two f32 vectors of size N and writes:
-//    result[i] = SiLU(gate[i]) * up[i]
+//  BitNet b1.58 uses Squared ReLU instead of SiLU for stable
+//  1-bit training.  This shader takes two f32 vectors and writes:
+//    result[i] = ReLU²(gate[i]) * up[i]
 
-const SHADER_SILU_MUL = /* wgsl */ `
+const SHADER_RELU2_MUL = /* wgsl */ `
 
 struct Params {
   n: u32,
@@ -845,13 +947,72 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let idx = gid.x;
   if (idx >= params.n) { return; }
 
-  let gate = gate_vec[idx];
-  let up   = up_vec[idx];
+  // Squared ReLU: max(0, g)² — stable activation for 1-bit weights
+  let gate = max(0.0, gate_vec[idx]);
+  result_vec[idx] = (gate * gate) * up_vec[idx];
+}
+`;
 
-  // SiLU (swish β=1): gate * σ(gate) = gate / (1 + exp(-gate))
-  let silu = gate / (1.0 + exp(-gate));
+// ════════════════════════════════════════════════
+// 5c′. WGSL – In-Place RMSNorm (GPU)
+// ════════════════════════════════════════════════
+//
+//  Normalises a vector in-place using RMSNorm with learned γ weights:
+//    rms = sqrt( mean(x²) + ε )
+//    x[i] = (x[i] / rms) * γ[i]
+//
+//  Dispatched as a SINGLE workgroup.  Each thread handles a strided
+//  slice of the vector for both the reduction and the write-back.
+//
+//  Bindings:
+//    @binding(0) vec (read_write) – the vector to normalise in-place
+//    @binding(1) gamma (read)     – learned γ weights
+//    @binding(2) params (uniform) – { n: u32 }
 
-  result_vec[idx] = silu * up;
+const SHADER_RMSNORM = /* wgsl */ `
+
+const WG_SIZE: u32 = ${WORKGROUP_SIZE}u;
+const EPS: f32     = 1e-5;
+
+struct Params {
+  n: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> vec:   array<f32>;
+@group(0) @binding(1) var<storage, read>       gamma: array<f32>;
+@group(0) @binding(2) var<uniform>             params: Params;
+
+var<workgroup> shared_sum: array<f32, ${WORKGROUP_SIZE}>;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(local_invocation_id) lid: vec3u) {
+  let tid = lid.x;
+  let n   = params.n;
+
+  // Phase 1: Partial sum of squares (strided)
+  var partial: f32 = 0.0;
+  for (var i: u32 = tid; i < n; i = i + WG_SIZE) {
+    let val = vec[i];
+    partial = partial + val * val;
+  }
+  shared_sum[tid] = partial;
+  workgroupBarrier();
+
+  // Phase 2: Binary reduction tree → shared_sum[0] = total sum
+  for (var s: u32 = WG_SIZE / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      shared_sum[tid] = shared_sum[tid] + shared_sum[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  // Phase 3: Compute inv_rms (all threads read shared_sum[0])
+  let inv_rms = 1.0 / sqrt(shared_sum[0] / f32(n) + EPS);
+
+  // Phase 4: Normalise + scale by γ (strided, non-overlapping)
+  for (var i: u32 = tid; i < n; i = i + WG_SIZE) {
+    vec[i] = vec[i] * inv_rms * gamma[i];
+  }
 }
 `;
 
@@ -859,12 +1020,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // 5d. WGSL – RoPE + KV Cache Write
 // ════════════════════════════════════════════════
 //
-//  Applies Rotary Positional Embeddings to Q and K vectors,
-//  then writes the rotated K and raw V into the persistent
+//  Applies Rotary Positional Embeddings to Q and K vectors
+//  using the Llama/HuggingFace "rotate_half" convention:
+//    pair(d, d + head_dim/2) for d = 0..head_dim/2-1
+//  NOT the GPT-NeoX interleaved convention (2d, 2d+1).
+//
+//  Then writes the rotated K and raw V into the persistent
 //  KV cache at the current sequence position.
 //
 //  Dispatch: ceil(Q_DIM / 2 / WORKGROUP_SIZE) workgroups.
-//  Each thread handles one consecutive dimension pair (2i, 2i+1).
+//  Each thread handles one (d, d+half_head) pair within a head.
 
 const SHADER_ROPE_CACHE = /* wgsl */ `
 
@@ -885,44 +1050,46 @@ struct RoPEParams {
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let pair_idx = gid.x;
-  let q_pairs  = params.q_dim  / 2u;   // 1280
-  let kv_pairs = params.kv_dim / 2u;   // 320
+  let half_head = params.head_dim / 2u;          // 64
+  let q_pairs   = params.q_dim  / 2u;            // 1280
+  let kv_pairs  = params.kv_dim / 2u;            // 320
 
   if (pair_idx >= q_pairs) { return; }
 
-  let pos       = f32(params.seq_pos);
-  let half_head = params.head_dim / 2u;
+  let pos = f32(params.seq_pos);
+
+  // ── Llama-style rotate_half RoPE pairing ──
+  // pair_idx encodes (head, d) where d ∈ [0, half_head).
+  // The pair is (head*head_dim + d, head*head_dim + d + half_head).
+  let head = pair_idx / half_head;
+  let d    = pair_idx % half_head;
+
+  // inv_freq[d] = 1 / (θ ^ (2d / head_dim))
+  let freq  = 1.0 / pow(${ROPE_THETA}, f32(d * 2u) / f32(params.head_dim));
+  let theta = pos * freq;
+  let cos_t = cos(theta);
+  let sin_t = sin(theta);
 
   // ── Apply RoPE to Q ──
   {
-    let dim_pair = pair_idx % half_head;
-    let freq     = 1.0 / pow(${ROPE_THETA}, f32(dim_pair * 2u) / f32(params.head_dim));
-    let theta    = pos * freq;
-    let cos_t    = cos(theta);
-    let sin_t    = sin(theta);
-
-    let i0 = pair_idx * 2u;
-    let i1 = i0 + 1u;
+    let i0 = head * params.head_dim + d;              // first-half dim
+    let i1 = i0 + half_head;                          // second-half dim
     let q0 = q_vec[i0];
     let q1 = q_vec[i1];
+    // rotate_half: embed[i] = x[i]*cos - x[i+half]*sin
+    //              embed[i+half] = x[i+half]*cos + x[i]*sin
     q_vec[i0] = q0 * cos_t - q1 * sin_t;
-    q_vec[i1] = q0 * sin_t + q1 * cos_t;
+    q_vec[i1] = q1 * cos_t + q0 * sin_t;
   }
 
   // ── Apply RoPE to K + write KV cache ──
   if (pair_idx < kv_pairs) {
-    let dim_pair = pair_idx % half_head;
-    let freq     = 1.0 / pow(${ROPE_THETA}, f32(dim_pair * 2u) / f32(params.head_dim));
-    let theta    = pos * freq;
-    let cos_t    = cos(theta);
-    let sin_t    = sin(theta);
-
-    let i0 = pair_idx * 2u;
-    let i1 = i0 + 1u;
+    let i0 = head * params.head_dim + d;
+    let i1 = i0 + half_head;
     let k0 = k_vec[i0];
     let k1 = k_vec[i1];
     let k0r = k0 * cos_t - k1 * sin_t;
-    let k1r = k0 * sin_t + k1 * cos_t;
+    let k1r = k1 * cos_t + k0 * sin_t;
 
     // Write rotated K into cache at current position
     let cache_off = params.seq_pos * params.kv_dim;
@@ -1223,11 +1390,15 @@ async function run2DKernel(device, weightMatrix, inputVec, M, K) {
     size:  16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(
-    uniformBuf,
-    0,
-    new Uint32Array([M, K, packedStride, 0]),
-  );
+  // Pack uniform: M(u32), K(u32), packed_stride(u32), weight_scale(f32)
+  const uniformData = new ArrayBuffer(16);
+  const uniformU32 = new Uint32Array(uniformData);
+  const uniformF32 = new Float32Array(uniformData);
+  uniformU32[0] = M;
+  uniformU32[1] = K;
+  uniformU32[2] = packedStride;
+  uniformF32[3] = 1.0;  // no scale for standalone test kernel
+  device.queue.writeBuffer(uniformBuf, 0, new Uint32Array(uniformData));
 
   // ── Pipeline ──
   const module   = device.createShaderModule({ code: SHADER_2D_TILED });
@@ -1318,11 +1489,17 @@ async function run2DKernelPacked(device, packedWeights, inputVec, M, K) {
     size:  16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(
-    uniformBuf,
-    0,
-    new Uint32Array([M, K, packedStride, 0]),
-  );
+  // Pack uniform: M(u32), K(u32), packed_stride(u32), weight_scale(f32)
+  {
+    const uData = new ArrayBuffer(16);
+    const uU32  = new Uint32Array(uData);
+    const uF32  = new Float32Array(uData);
+    uU32[0] = M;
+    uU32[1] = K;
+    uU32[2] = packedStride;
+    uF32[3] = 1.0;  // no scale for standalone packed kernel
+    device.queue.writeBuffer(uniformBuf, 0, new Uint8Array(uData));
+  }
 
   // ── Pipeline ──
   const module   = device.createShaderModule({ code: SHADER_2D_TILED });
@@ -1374,12 +1551,12 @@ async function run2DKernelPacked(device, packedWeights, inputVec, M, K) {
 }
 
 // ════════════════════════════════════════════════
-// 8b. SiLU · Multiply Kernel – Pipeline, Buffers, Dispatch
+// 8b. ReLU² · Multiply Kernel – Pipeline, Buffers, Dispatch
 // ════════════════════════════════════════════════
 
 /**
- * Run the SiLU·Mul element-wise kernel on the GPU.
- *   result[i] = SiLU(gateData[i]) * upData[i]
+ * Run the ReLU²·Mul element-wise kernel on the GPU.
+ *   result[i] = ReLU²(gateData[i]) * upData[i]
  *
  * @param {GPUDevice}    device   – WebGPU device
  * @param {Float32Array} gateData – gate_proj output (length n)
@@ -1387,45 +1564,45 @@ async function run2DKernelPacked(device, packedWeights, inputVec, M, K) {
  * @param {number}       n        – vector length
  * @returns {{ results: Float32Array, computeMs: number }}
  */
-async function runSiLUMulKernel(device, gateData, upData, n) {
+async function runReLU2MulKernel(device, gateData, upData, n) {
   const setupT0 = performance.now();
 
   // ── Buffers ──
   const gateBuf = device.createBuffer({
-    label: "silu-gate",
+    label: "relu2-gate",
     size:  n * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(gateBuf, 0, new Float32Array(gateData));
 
   const upBuf = device.createBuffer({
-    label: "silu-up",
+    label: "relu2-up",
     size:  n * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(upBuf, 0, new Float32Array(upData));
 
   const resultBuf = device.createBuffer({
-    label: "silu-result",
+    label: "relu2-result",
     size:  n * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 
   const stagingBuf = device.createBuffer({
-    label: "silu-staging",
+    label: "relu2-staging",
     size:  n * 4,
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
 
   const uniformBuf = device.createBuffer({
-    label: "silu-params",
+    label: "relu2-params",
     size:  4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(uniformBuf, 0, new Uint32Array([n]));
 
   // ── Pipeline ──
-  const module = device.createShaderModule({ code: SHADER_SILU_MUL });
+  const module = device.createShaderModule({ code: SHADER_RELU2_MUL });
   const bgl = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
@@ -1698,18 +1875,26 @@ function sampleToken(logits, temperature = 1.0, topK = 50, topP = 0.9,
  * LM Head dot products don't overflow FP32.
  *
  * In the real model an RMSNorm layer (with learned weights) sits
- * between the MLP output and the LM Head.  We skip those weights
- * for now and just apply the mathematical normalisation:
+ * between the MLP output and the LM Head.  When a learned weight
+ * vector (gamma) is provided, each normalised element is scaled
+ * by the corresponding gamma value:
  *   rms = sqrt( mean(x²) + ε )
- *   out[i] = x[i] / rms
+ *   out[i] = (x[i] / rms) * γ[i]
+ *
+ * If no weight vector is supplied, plain mathematical normalisation
+ * is applied (backward-compatible fallback).
  */
-function simpleRMSNorm(arr) {
+function simpleRMSNorm(arr, weightVec) {
   const n = arr.length;
   let sumSq = 0;
   for (let i = 0; i < n; i++) sumSq += arr[i] * arr[i];
-  const rms = Math.sqrt(sumSq / n + 1e-6);
+  const rms = Math.sqrt(sumSq / n + 1e-5);
   const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = arr[i] / rms;
+  if (weightVec) {
+    for (let i = 0; i < n; i++) out[i] = (arr[i] / rms) * weightVec[i];
+  } else {
+    for (let i = 0; i < n; i++) out[i] = arr[i] / rms;
+  }
   return out;
 }
 
@@ -1723,8 +1908,8 @@ function simpleRMSNorm(arr) {
 //
 //   Pass 1: gate_out  = gate_proj  × input   (M_mid × K_in → M_mid)
 //   Pass 2: up_out    = up_proj    × input   (M_mid × K_in → M_mid)
-//   Pass 3: silu_out  = SiLU(gate_out) ⊙ up_out   (element-wise)
-//   Pass 4: result    = down_proj  × silu_out     (M_out × M_mid → M_out)
+//   Pass 3: relu2_out = ReLU²(gate_out) ⊙ up_out   (element-wise)
+//   Pass 4: result    = down_proj  × relu2_out    (M_out × M_mid → M_out)
 //
 
 /**
@@ -1737,9 +1922,14 @@ function simpleRMSNorm(arr) {
  * @param {Float32Array} inputVec    – embedding vector (length HIDDEN_DIM)
  * @param {number}       hiddenDim   – input/output dimension   (2560)
  * @param {number}       mlpDim      – intermediate dimension   (6912)
+ * @param {number}       gateScale   – weight_scale for gate_proj  (default 1.0)
+ * @param {number}       upScale     – weight_scale for up_proj    (default 1.0)
+ * @param {number}       downScale   – weight_scale for down_proj  (default 1.0)
+ * @param {Float32Array} ffnSubNorm  – sub-norm γ between ReLU²·mul & down_proj (dim mlpDim)
  * @returns {{ results: Float32Array, setupMs: number, computeMs: number }}
  */
-async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim) {
+async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim,
+                          gateScale = 1.0, upScale = 1.0, downScale = 1.0, ffnSubNorm = null) {
   const setupT0 = performance.now();
 
   const gateStride = Math.ceil(hiddenDim / 16);  // gate/up: K = hiddenDim
@@ -1805,39 +1995,52 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
   });
 
   // ── Uniform buffers ────────────────────────────────────
-  //  gate/up params: M=mlpDim, K=hiddenDim, stride=gateStride
-  const gateUpUniform = device.createBuffer({
-    label: "mlp-gate-up-params",
+  //  Helper to write [M(u32), K(u32), stride(u32), scale(f32)]
+  function writeMatUniform(buf, Mu, Ku, stride, scale) {
+    const d = new ArrayBuffer(16);
+    new Uint32Array(d)[0] = Mu;
+    new Uint32Array(d)[1] = Ku;
+    new Uint32Array(d)[2] = stride;
+    new Float32Array(d)[3] = scale;
+    device.queue.writeBuffer(buf, 0, new Uint8Array(d));
+  }
+
+  //  gate params: M=mlpDim, K=hiddenDim, stride=gateStride, scale=gateScale
+  const gateUniform = device.createBuffer({
+    label: "mlp-gate-params",
     size:  16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(
-    gateUpUniform, 0,
-    new Uint32Array([mlpDim, hiddenDim, gateStride, 0]),
-  );
+  writeMatUniform(gateUniform, mlpDim, hiddenDim, gateStride, gateScale);
 
-  //  SiLU·mul params: n=mlpDim
-  const siluUniform = device.createBuffer({
-    label: "mlp-silu-params",
+  //  up params: M=mlpDim, K=hiddenDim, stride=gateStride, scale=upScale
+  const upUniform = device.createBuffer({
+    label: "mlp-up-params",
+    size:  16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  writeMatUniform(upUniform, mlpDim, hiddenDim, gateStride, upScale);
+
+  //  ReLU²·mul params: n=mlpDim
+  const relu2Uniform = device.createBuffer({
+    label: "mlp-relu2-params",
     size:  4,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(siluUniform, 0, new Uint32Array([mlpDim]));
+  device.queue.writeBuffer(relu2Uniform, 0, new Uint32Array([mlpDim]));
 
-  //  down params: M=hiddenDim, K=mlpDim, stride=downStride
+  //  down params: M=hiddenDim, K=mlpDim, stride=downStride, scale=downScale
   const downUniform = device.createBuffer({
     label: "mlp-down-params",
     size:  16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(
-    downUniform, 0,
-    new Uint32Array([hiddenDim, mlpDim, downStride, 0]),
-  );
+  writeMatUniform(downUniform, hiddenDim, mlpDim, downStride, downScale);
 
   // ── Compile pipelines (FP32 tiled mat-vec) ──
   const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
-  const siluModule = device.createShaderModule({ code: SHADER_SILU_MUL });
+  const relu2Module = device.createShaderModule({ code: SHADER_RELU2_MUL });
+  const normModule = device.createShaderModule({ code: SHADER_RMSNORM });
 
   const matBGL = device.createBindGroupLayout({
     entries: [
@@ -1862,7 +2065,19 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
   });
   const siluPipeline = device.createComputePipeline({
     layout:  device.createPipelineLayout({ bindGroupLayouts: [siluBGL] }),
-    compute: { module: siluModule, entryPoint: "main" },
+    compute: { module: relu2Module, entryPoint: "main" },
+  });
+
+  const normBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const normPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [normBGL] }),
+    compute: { module: normModule, entryPoint: "main" },
   });
 
   // ── Bind groups ────────────────────────────────────────
@@ -1872,7 +2087,7 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: gateWeightBuf } },
       { binding: 2, resource: { buffer: gateOutBuf } },
-      { binding: 3, resource: { buffer: gateUpUniform } },
+      { binding: 3, resource: { buffer: gateUniform } },
     ],
   });
 
@@ -1882,7 +2097,7 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: upWeightBuf } },
       { binding: 2, resource: { buffer: upOutBuf } },
-      { binding: 3, resource: { buffer: gateUpUniform } },  // same dims
+      { binding: 3, resource: { buffer: upUniform } },
     ],
   });
 
@@ -1892,7 +2107,30 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
       { binding: 0, resource: { buffer: gateOutBuf } },
       { binding: 1, resource: { buffer: upOutBuf } },
       { binding: 2, resource: { buffer: siluOutBuf } },
-      { binding: 3, resource: { buffer: siluUniform } },
+      { binding: 3, resource: { buffer: relu2Uniform } },
+    ],
+  });
+
+  // ── ffn_sub_norm: RMSNorm between ReLU²·mul output and down_proj ──
+  const ffnNormGammaBuf = device.createBuffer({
+    label: "mlp-ffn-sub-norm-gamma",
+    size:  mlpDim * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  if (ffnSubNorm) device.queue.writeBuffer(ffnNormGammaBuf, 0, ffnSubNorm);
+
+  const ffnNormUniform = device.createBuffer({
+    label: "mlp-ffn-sub-norm-params", size: 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(ffnNormUniform, 0, new Uint32Array([mlpDim]));
+
+  const normBG = device.createBindGroup({
+    layout: normBGL,
+    entries: [
+      { binding: 0, resource: { buffer: siluOutBuf } },
+      { binding: 1, resource: { buffer: ffnNormGammaBuf } },
+      { binding: 2, resource: { buffer: ffnNormUniform } },
     ],
   });
 
@@ -1928,14 +2166,21 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
   pass2.dispatchWorkgroups(mlpDim);
   pass2.end();
 
-  // Pass 3: silu_out = SiLU(gate_out) ⊙ up_out
+  // Pass 3: relu2_out = ReLU²(gate_out) ⊙ up_out
   const pass3 = encoder.beginComputePass();
   pass3.setPipeline(siluPipeline);
   pass3.setBindGroup(0, siluBG);
   pass3.dispatchWorkgroups(Math.ceil(mlpDim / WORKGROUP_SIZE));
   pass3.end();
 
-  // Pass 4: result = down_proj × silu_out
+  // Pass 3b: ffn_sub_norm – RMSNorm on ReLU²·mul output (in-place)
+  const pass3b = encoder.beginComputePass();
+  pass3b.setPipeline(normPipeline);
+  pass3b.setBindGroup(0, normBG);
+  pass3b.dispatchWorkgroups(1);  // single workgroup for reduction
+  pass3b.end();
+
+  // Pass 4: result = down_proj × relu2_out (after sub-norm)
   const pass4 = encoder.beginComputePass();
   pass4.setPipeline(matPipeline);
   pass4.setBindGroup(0, downBG);
@@ -1960,7 +2205,8 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
     inputBuf, gateWeightBuf, upWeightBuf, downWeightBuf,
     gateOutBuf, upOutBuf, siluOutBuf,
     resultBuf, stagingBuf,
-    gateUpUniform, siluUniform, downUniform,
+    gateUniform, upUniform, relu2Uniform, downUniform,
+    ffnNormGammaBuf, ffnNormUniform,
   ].forEach((b) => b.destroy());
 
   return { results, setupMs, computeMs };
@@ -1989,9 +2235,18 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
  * @param {Uint32Array}  oW          – packed o_proj weights
  * @param {Float32Array} inputVec    – normed hidden state (length HIDDEN_DIM)
  * @param {number}       seqPosition – current position in KV cache
- * @returns {{ results: Float32Array, setupMs: number, computeMs: number, newSeqPos: number }}
+ * @param {GPUBuffer}    kCache      – persistent K cache buffer for this layer
+ * @param {GPUBuffer}    vCache      – persistent V cache buffer for this layer
+ * @param {number}       qScale      – weight_scale for q_proj  (default 1.0)
+ * @param {number}       kScale      – weight_scale for k_proj  (default 1.0)
+ * @param {number}       vScale      – weight_scale for v_proj  (default 1.0)
+ * @param {number}       oScale      – weight_scale for o_proj  (default 1.0)
+ * @param {Float32Array} attnSubNorm – sub-norm γ between GQA out & o_proj (dim Q_DIM)
+ * @returns {{ results: Float32Array, setupMs: number, computeMs: number }}
  */
-async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
+async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition, kCache, vCache,
+                                qScale = 1.0, kScale = 1.0, vScale = 1.0, oScale = 1.0,
+                                attnSubNorm = null) {
   const setupT0 = performance.now();
 
   const qStride = Math.ceil(HIDDEN_DIM / 16);  // Q: K = 2560, stride = 160
@@ -2070,19 +2325,36 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
   });
 
   // ── Uniform buffers ────────────────────────────────────
-  // Q proj: M=Q_DIM(2560), K=HIDDEN_DIM(2560), stride=160
+  // Helper to write [M(u32), K(u32), stride(u32), weight_scale(f32)]
+  function writeAttnMatUniform(buf, Mu, Ku, stride, scale) {
+    const d = new ArrayBuffer(16);
+    new Uint32Array(d)[0] = Mu;
+    new Uint32Array(d)[1] = Ku;
+    new Uint32Array(d)[2] = stride;
+    new Float32Array(d)[3] = scale;
+    device.queue.writeBuffer(buf, 0, new Uint8Array(d));
+  }
+
+  // Q proj: M=Q_DIM(2560), K=HIDDEN_DIM(2560), stride=160, scale=qScale
   const qUniform = device.createBuffer({
     label: "attn-q-params", size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(qUniform, 0, new Uint32Array([Q_DIM, HIDDEN_DIM, qStride, 0]));
+  writeAttnMatUniform(qUniform, Q_DIM, HIDDEN_DIM, qStride, qScale);
 
-  // K/V proj: M=KV_DIM(640), K=HIDDEN_DIM(2560), stride=160
-  const kvUniform = device.createBuffer({
-    label: "attn-kv-params", size: 16,
+  // K proj: M=KV_DIM(640), K=HIDDEN_DIM(2560), stride=160, scale=kScale
+  const kProjUniform = device.createBuffer({
+    label: "attn-k-params", size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(kvUniform, 0, new Uint32Array([KV_DIM, HIDDEN_DIM, kStride, 0]));
+  writeAttnMatUniform(kProjUniform, KV_DIM, HIDDEN_DIM, kStride, kScale);
+
+  // V proj: M=KV_DIM(640), K=HIDDEN_DIM(2560), stride=160, scale=vScale
+  const vProjUniform = device.createBuffer({
+    label: "attn-v-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  writeAttnMatUniform(vProjUniform, KV_DIM, HIDDEN_DIM, kStride, vScale);
 
   // RoPE: seq_pos, q_dim, kv_dim, head_dim
   const ropeUniform = device.createBuffer({
@@ -2098,17 +2370,32 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
   });
   device.queue.writeBuffer(gqaUniform, 0, new Uint32Array([seqPosition + 1, KV_DIM, HEAD_DIM, NUM_Q_HEADS]));
 
-  // O proj: M=HIDDEN_DIM(2560), K=Q_DIM(2560), stride=160
+  // O proj: M=HIDDEN_DIM(2560), K=Q_DIM(2560), stride=160, scale=oScale
   const oUniform = device.createBuffer({
     label: "attn-o-params", size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(oUniform, 0, new Uint32Array([HIDDEN_DIM, Q_DIM, oStride, 0]));
+  writeAttnMatUniform(oUniform, HIDDEN_DIM, Q_DIM, oStride, oScale);
+
+  // ── attn_sub_norm: RMSNorm between GQA output and O projection ──
+  const normGammaBuf = device.createBuffer({
+    label: "attn-sub-norm-gamma",
+    size:  Q_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  if (attnSubNorm) device.queue.writeBuffer(normGammaBuf, 0, attnSubNorm);
+
+  const normUniform = device.createBuffer({
+    label: "attn-sub-norm-params", size: 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(normUniform, 0, new Uint32Array([Q_DIM]));
 
   // ── Compile pipelines (FP32 tiled mat-vec projections) ──
   const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
   const ropeModule = device.createShaderModule({ code: SHADER_ROPE_CACHE });
   const gqaModule  = device.createShaderModule({ code: SHADER_GQA_ATTENTION });
+  const normModule = device.createShaderModule({ code: SHADER_RMSNORM });
 
   const matBGL = device.createBindGroupLayout({
     entries: [
@@ -2152,6 +2439,18 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
     compute: { module: gqaModule, entryPoint: "main" },
   });
 
+  const normBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const normPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [normBGL] }),
+    compute: { module: normModule, entryPoint: "main" },
+  });
+
   // ── Bind groups ────────────────────────────────────────
   // Pass 1: q_vec = q_proj × input
   const qBG = device.createBindGroup({
@@ -2171,7 +2470,7 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: kWeightBuf } },
       { binding: 2, resource: { buffer: kVecBuf } },
-      { binding: 3, resource: { buffer: kvUniform } },
+      { binding: 3, resource: { buffer: kProjUniform } },
     ],
   });
 
@@ -2182,7 +2481,7 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
       { binding: 0, resource: { buffer: inputBuf } },
       { binding: 1, resource: { buffer: vWeightBuf } },
       { binding: 2, resource: { buffer: vVecBuf } },
-      { binding: 3, resource: { buffer: kvUniform } },  // same dims as K
+      { binding: 3, resource: { buffer: vProjUniform } },
     ],
   });
 
@@ -2193,8 +2492,8 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
       { binding: 0, resource: { buffer: qVecBuf } },
       { binding: 1, resource: { buffer: kVecBuf } },
       { binding: 2, resource: { buffer: vVecBuf } },
-      { binding: 3, resource: { buffer: kCacheBuf } },
-      { binding: 4, resource: { buffer: vCacheBuf } },
+      { binding: 3, resource: { buffer: kCache } },
+      { binding: 4, resource: { buffer: vCache } },
       { binding: 5, resource: { buffer: ropeUniform } },
     ],
   });
@@ -2204,14 +2503,24 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
     layout: gqaBGL,
     entries: [
       { binding: 0, resource: { buffer: qVecBuf } },
-      { binding: 1, resource: { buffer: kCacheBuf } },
-      { binding: 2, resource: { buffer: vCacheBuf } },
+      { binding: 1, resource: { buffer: kCache } },
+      { binding: 2, resource: { buffer: vCache } },
       { binding: 3, resource: { buffer: attnOutBuf } },
       { binding: 4, resource: { buffer: gqaUniform } },
     ],
   });
 
-  // Pass 6: result = o_proj × attn_out
+  // Pass 5b: RMSNorm on attnOutBuf (in-place, before o_proj)
+  const normBG = device.createBindGroup({
+    layout: normBGL,
+    entries: [
+      { binding: 0, resource: { buffer: attnOutBuf } },
+      { binding: 1, resource: { buffer: normGammaBuf } },
+      { binding: 2, resource: { buffer: normUniform } },
+    ],
+  });
+
+  // Pass 6: result = o_proj × attn_out (after sub-norm)
   const oBG = device.createBindGroup({
     layout: matBGL,
     entries: [
@@ -2265,6 +2574,13 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
   p5.dispatchWorkgroups(NUM_Q_HEADS);
   p5.end();
 
+  // Pass 5b: attn_sub_norm – RMSNorm on attention output (in-place)
+  const p5b = encoder.beginComputePass();
+  p5b.setPipeline(normPipeline);
+  p5b.setBindGroup(0, normBG);
+  p5b.dispatchWorkgroups(1);  // single workgroup for reduction
+  p5b.end();
+
   // Pass 6: O projection (2560 × 2560 → 2560)
   const p6 = encoder.beginComputePass();
   p6.setPipeline(matPipeline);
@@ -2283,15 +2599,16 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
 
   const computeMs = performance.now() - computeT0;
 
-  // Cleanup (do NOT destroy kCacheBuf/vCacheBuf – they persist!)
+  // Cleanup (do NOT destroy kCache/vCache – they persist!)
   [
     inputBuf, qWeightBuf, kWeightBuf, vWeightBuf, oWeightBuf,
     qVecBuf, kVecBuf, vVecBuf, attnOutBuf,
     resultBuf, stagingBuf,
-    qUniform, kvUniform, ropeUniform, gqaUniform, oUniform,
+    qUniform, kProjUniform, vProjUniform, ropeUniform, gqaUniform, oUniform,
+    normGammaBuf, normUniform,
   ].forEach(b => b.destroy());
 
-  return { results, setupMs, computeMs, newSeqPos: seqPosition + 1 };
+  return { results, setupMs, computeMs };
 }
 
 // ════════════════════════════════════════════════
@@ -2350,18 +2667,21 @@ async function main() {
   const device = await initWebGPU();
   log("✔ WebGPU device acquired", "info");
 
-  // ── Allocate persistent KV cache buffers ──
-  kCacheBuf = device.createBuffer({
-    label: "kv-cache-k",
-    size:  MAX_SEQ_LEN * KV_DIM * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  vCacheBuf = device.createBuffer({
-    label: "kv-cache-v",
-    size:  MAX_SEQ_LEN * KV_DIM * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  log(`  KV Cache allocated: 2 × ${MAX_SEQ_LEN} × ${KV_DIM} × 4 = ${(2 * MAX_SEQ_LEN * KV_DIM * 4 / 1024).toFixed(0)} KB`, 'info');
+  // ── Allocate 26 persistent KV cache buffer pairs ──
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    kCacheBufs.push(device.createBuffer({
+      label: `kv-cache-k-layer-${i}`,
+      size:  MAX_SEQ_LEN * KV_DIM * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    }));
+    vCacheBufs.push(device.createBuffer({
+      label: `kv-cache-v-layer-${i}`,
+      size:  MAX_SEQ_LEN * KV_DIM * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    }));
+  }
+  const kvTotalKB = NUM_LAYERS * 2 * MAX_SEQ_LEN * KV_DIM * 4 / 1024;
+  log(`  KV Cache allocated: ${NUM_LAYERS} layers × 2 × ${MAX_SEQ_LEN} × ${KV_DIM} × 4 = ${(kvTotalKB / 1024).toFixed(1)} MB`, 'info');
   log("");
 
   // ─────────────────────────────────────────────
@@ -2523,9 +2843,9 @@ async function main() {
   log("");
 
   try {
-    // Fetch pre-packed binary weights
-    log("  Fetching bitnet_layer_0_down_proj.bin ...");
-    const resp = await fetch("bitnet_layer_0_down_proj.bin");
+    // Fetch pre-packed binary weights (now from weights/ directory)
+    log("  Fetching weights/bitnet_layer_0_down_proj.bin ...");
+    const resp = await fetch("weights/bitnet_layer_0_down_proj.bin");
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
     const buf  = await resp.arrayBuffer();
     const packedReal = new Uint32Array(buf);
@@ -2593,117 +2913,35 @@ async function main() {
     }
   } catch (err) {
     log(`  ❌ FAIL – Could not run real weights test: ${err.message}`, "fail");
-    log(`     Make sure bitnet_layer_0_down_proj.bin is served alongside index.html`, "info");
+    log(`     Make sure weights/ directory is served alongside index.html`, "info");
   }
   log("");
 
   // ─────────────────────────────────────────────
-  // Load Full MLP Weights (gate_proj + up_proj + down_proj)
+  // Load All 26 Transformer Layers
   // ─────────────────────────────────────────────
 
-  log(`━━━ Loading Full SwiGLU MLP Weights (Layer 0) ━━━`);
-  log("");
-
   try {
-    const mlpFiles = [
-      { name: "gate_proj", file: "bitnet_layer_0_gate_proj.bin", M: MLP_DIM, K: HIDDEN_DIM },
-      { name: "up_proj",   file: "bitnet_layer_0_up_proj.bin",   M: MLP_DIM, K: HIDDEN_DIM },
-      { name: "down_proj", file: "bitnet_layer_0_down_proj.bin", M: HIDDEN_DIM, K: MLP_DIM },
-    ];
-
-    const [gateResp, upResp, downResp] = await Promise.all(
-      mlpFiles.map(f => fetch(f.file)),
-    );
-    const responses = [gateResp, upResp, downResp];
-
-    for (let i = 0; i < mlpFiles.length; i++) {
-      if (!responses[i].ok) {
-        throw new Error(`${mlpFiles[i].file}: HTTP ${responses[i].status}`);
-      }
-    }
-
-    const [gateBuf, upBuf, downBuf] = await Promise.all(
-      responses.map(r => r.arrayBuffer()),
-    );
-
-    gateWeights = new Uint32Array(gateBuf);
-    upWeights   = new Uint32Array(upBuf);
-    downWeights = new Uint32Array(downBuf);
-
-    for (let i = 0; i < mlpFiles.length; i++) {
-      const w = [gateWeights, upWeights, downWeights][i];
-      const { name, M: mRows, K: kCols } = mlpFiles[i];
-      const stride = Math.ceil(kCols / 16);
-      const expected = mRows * stride;
-      log(`  ${name}: ${w.length.toLocaleString()} u32 (${(w.byteLength / 1024).toFixed(1)} KB)` +
-          ` — ${mRows}×${kCols}, stride ${stride}`, "info");
-      if (w.length !== expected) {
-        throw new Error(`${name} size mismatch: got ${w.length}, expected ${expected}`);
-      }
-    }
-
-    log("");
-    log("  ✅ All MLP weights loaded – SwiGLU pipeline ready", "pass");
+    await loadAllLayers();
   } catch (err) {
-    log(`  ❌ FAIL – Could not load MLP weights: ${err.message}`, "fail");
-    log(`     Run: python extract_full_mlp.py  to generate all .bin files`, "info");
-    gateWeights = null;
-    upWeights   = null;
-    downWeights = null;
+    log(`  ❌ FAIL – Could not load transformer layers: ${err.message}`, "fail");
+    log(`     Run: python extract_all_layers.py  to generate the weights/ directory`, "info");
   }
-  log("");
 
   // ─────────────────────────────────────────────
-  // Load Self-Attention Weights (q_proj + k_proj + v_proj + o_proj)
+  // Load Final RMSNorm Weights
   // ─────────────────────────────────────────────
-
-  log(`━━━ Loading Self-Attention Weights (Layer 0) ━━━`);
-  log("");
-
   try {
-    const attnFiles = [
-      { name: "q_proj", file: "bitnet_layer_0_q_proj.bin", M: Q_DIM,      K: HIDDEN_DIM },
-      { name: "k_proj", file: "bitnet_layer_0_k_proj.bin", M: KV_DIM,     K: HIDDEN_DIM },
-      { name: "v_proj", file: "bitnet_layer_0_v_proj.bin", M: KV_DIM,     K: HIDDEN_DIM },
-      { name: "o_proj", file: "bitnet_layer_0_o_proj.bin", M: HIDDEN_DIM, K: Q_DIM },
-    ];
-
-    const attnResponses = await Promise.all(attnFiles.map(f => fetch(f.file)));
-    for (let i = 0; i < attnFiles.length; i++) {
-      if (!attnResponses[i].ok) {
-        throw new Error(`${attnFiles[i].file}: HTTP ${attnResponses[i].status}`);
-      }
-    }
-
-    const attnBufs = await Promise.all(attnResponses.map(r => r.arrayBuffer()));
-    qProjWeights = new Uint32Array(attnBufs[0]);
-    kProjWeights = new Uint32Array(attnBufs[1]);
-    vProjWeights = new Uint32Array(attnBufs[2]);
-    oProjWeights = new Uint32Array(attnBufs[3]);
-
-    const allAttnWeights = [qProjWeights, kProjWeights, vProjWeights, oProjWeights];
-    for (let i = 0; i < attnFiles.length; i++) {
-      const w = allAttnWeights[i];
-      const { name, M: mRows, K: kCols } = attnFiles[i];
-      const stride = Math.ceil(kCols / 16);
-      const expected = mRows * stride;
-      log(`  ${name}: ${w.length.toLocaleString()} u32 (${(w.byteLength / 1024).toFixed(1)} KB)` +
-          ` — ${mRows}×${kCols}, stride ${stride}`, "info");
-      if (w.length !== expected) {
-        throw new Error(`${name} size mismatch: got ${w.length}, expected ${expected}`);
-      }
-    }
-
-    log("");
-    log("  ✅ All attention weights loaded – Self-Attention pipeline ready", "pass");
-    log(`  GQA config: ${NUM_Q_HEADS} Q heads, ${NUM_KV_HEADS} KV heads, group size ${GQA_GROUP_SIZE}`, "info");
+    log('Loading final RMSNorm weights …', 'info');
+    const fnResp = await fetch('weights/bitnet_final_norm.bin');
+    if (!fnResp.ok) throw new Error(`HTTP ${fnResp.status}`);
+    const fnBuf = await fnResp.arrayBuffer();
+    finalNormWeights = new Float32Array(fnBuf);
+    log(`  ✔ Final norm loaded: ${finalNormWeights.length} dims ` +
+        `(${(fnBuf.byteLength / 1024).toFixed(1)} KB)`, 'pass');
   } catch (err) {
-    log(`  ❌ FAIL – Could not load attention weights: ${err.message}`, "fail");
-    log(`     Run: python extract_attention.py  to generate the .bin files`, "info");
-    qProjWeights = null;
-    kProjWeights = null;
-    vProjWeights = null;
-    oProjWeights = null;
+    log(`  ❌ FAIL – Could not load final norm: ${err.message}`, 'fail');
+    log(`     Run: python extract_rmsnorm.py  to generate the norm weights`, 'info');
   }
   log("");
 
@@ -2724,8 +2962,8 @@ async function main() {
   gpuDevice = device;
   log("");
 
-  if (gateWeights && upWeights && downWeights && lmHeadWeights) {
-    log("✔ Interactive mode ready (Auto-Regressive Generation) – type a prompt and click Generate!", "pass");
+  if (layers.length === NUM_LAYERS && lmHeadWeights) {
+    log(`✔ Interactive mode ready – ${NUM_LAYERS}-layer brain loaded! Type a prompt and click Generate!`, "pass");
     const inputEl = document.getElementById("user-text");
     const btnEl   = document.getElementById("compute-btn");
     if (inputEl) inputEl.disabled = false;
@@ -2754,10 +2992,11 @@ const EOS_TOKENS = new Set([128001, 128009]);
 /**
  * Run one full transformer forward pass for a single token.
  *
- * Pipeline:  Embedding → RMSNorm → Self-Attention → Residual
- *          → RMSNorm → SwiGLU MLP → Residual → RMSNorm → LM Head
+ * Pipeline:  Embedding → [Layer 0..25: RMSNorm → Self-Attention →
+ *            Residual → RMSNorm → SwiGLU MLP → Residual] →
+ *            RMSNorm → LM Head
  *
- * Advances the global `seqPos` by 1 and updates the KV cache.
+ * Advances the global `seqPos` by 1 and updates ALL 26 KV caches.
  *
  * @param {number} tokenId – original Llama 3 token ID
  * @returns {Promise<{logits: Float32Array, totalMs: number}>}
@@ -2766,47 +3005,57 @@ async function forward(tokenId) {
   const t0 = performance.now();
 
   // 1. Embedding lookup
-  const emb = getEmbeddingByTokenId(tokenId);
+  let hidden = getEmbeddingByTokenId(tokenId);
 
-  // 2. Pre-attention RMSNorm + Self-Attention
-  let postAttnResidual = emb;
+  // 2. Deep transformer loop: 30 layers
+  for (let i = 0; i < NUM_LAYERS; i++) {
+    const layer = layers[i];
 
-  if (qProjWeights && kProjWeights && vProjWeights && oProjWeights && kCacheBuf && vCacheBuf) {
-    const normedForAttn = simpleRMSNorm(emb);
+    // ── Pre-attention RMSNorm (with learned γ weights) ──
+    const normedForAttn = simpleRMSNorm(hidden, layer.attnNorm);
 
-    // 3. Self-Attention (Q/K/V proj → RoPE → KV cache → GQA → O proj)
+    // ── Self-Attention (Q/K/V proj → RoPE → KV cache → GQA → sub-norm → O proj) ──
     const attnResult = await runSelfAttention(
-      gpuDevice, qProjWeights, kProjWeights, vProjWeights, oProjWeights,
+      gpuDevice,
+      layer.qW, layer.kW, layer.vW, layer.oW,
       normedForAttn, seqPos,
+      kCacheBufs[i], vCacheBufs[i],
+      layer.qScale, layer.kScale, layer.vScale, layer.oScale,
+      layer.attnSubNorm,
     );
-    seqPos = attnResult.newSeqPos;
 
-    // 4. Post-attention residual connection
-    postAttnResidual = new Float32Array(HIDDEN_DIM);
-    for (let i = 0; i < HIDDEN_DIM; i++) {
-      postAttnResidual[i] = emb[i] + attnResult.results[i];
+    // ── Post-attention residual connection ──
+    const postAttn = new Float32Array(HIDDEN_DIM);
+    for (let d = 0; d < HIDDEN_DIM; d++) {
+      postAttn[d] = hidden[d] + attnResult.results[d];
+    }
+
+    // ── Pre-MLP RMSNorm (with learned γ weights) ──
+    const normedForMLP = simpleRMSNorm(postAttn, layer.mlpNorm);
+
+    // ── ReLU²-gated MLP (gate → up → ReLU²·mul → sub-norm → down) ──
+    const { results: mlpOut } = await runFullMLP(
+      gpuDevice,
+      layer.gateW, layer.upW, layer.downW,
+      normedForMLP, HIDDEN_DIM, MLP_DIM,
+      layer.gateScale, layer.upScale, layer.downScale,
+      layer.ffnSubNorm,
+    );
+
+    // ── Post-MLP residual connection ──
+    hidden = new Float32Array(HIDDEN_DIM);
+    for (let d = 0; d < HIDDEN_DIM; d++) {
+      hidden[d] = postAttn[d] + mlpOut[d];
     }
   }
 
-  // 5. Pre-MLP RMSNorm
-  const normedForMLP = simpleRMSNorm(postAttnResidual);
+  // Advance sequence position (once per token, shared across all layers)
+  seqPos += 1;
 
-  // 6. SwiGLU MLP (gate → up → SiLU·mul → down)
-  const { results: mlpOut } = await runFullMLP(
-    gpuDevice, gateWeights, upWeights, downWeights,
-    normedForMLP, HIDDEN_DIM, MLP_DIM,
-  );
+  // 3. Final RMSNorm (with learned γ weights)
+  const normedFinal = simpleRMSNorm(hidden, finalNormWeights);
 
-  // 7. Post-MLP residual connection
-  const postMLPResidual = new Float32Array(HIDDEN_DIM);
-  for (let i = 0; i < HIDDEN_DIM; i++) {
-    postMLPResidual[i] = postAttnResidual[i] + mlpOut[i];
-  }
-
-  // 8. Pre-LM-Head RMSNorm
-  const normedFinal = simpleRMSNorm(postMLPResidual);
-
-  // 9. LM Head → logits
+  // 4. LM Head → logits
   const { results: logits } = await runLMHeadKernel(
     gpuDevice, lmHeadWeights, normedFinal, LM_HEAD_ROWS, HIDDEN_DIM,
   );

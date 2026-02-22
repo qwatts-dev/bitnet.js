@@ -38,7 +38,9 @@ def unpack_hf_weights(packed_bytes: np.ndarray, M: int, K: int) -> np.ndarray:
     Unpack HF's row-packed uint8 tensor into a full (M, K) ternary int8 matrix.
 
     HF stores (M/4, K) uint8 with 4 weights per byte along the row dimension.
-    2-bit codes: 0b00→0, 0b01→+1, 0b10→-1.
+    Packed in contiguous blocks: bits[1:0] → rows 0..M/4-1,
+    bits[3:2] → rows M/4..M/2-1, etc.
+    2-bit codes after subtracting 1: 0→-1, 1→0, 2→+1.
 
     Returns np.ndarray of shape (M, K) with values in {-1, 0, +1}.
     """
@@ -46,16 +48,14 @@ def unpack_hf_weights(packed_bytes: np.ndarray, M: int, K: int) -> np.ndarray:
     assert packed_rows * 4 == M, f"Expected {M/4} packed rows, got {packed_rows}"
     assert packed_bytes.shape[1] == K
 
-    # Vectorised extraction of 4 weights per byte
     weights = np.zeros((M, K), dtype=np.int8)
     b = packed_bytes.astype(np.uint8)
 
     for i in range(4):
         codes = (b >> (i * 2)) & 0x03  # shape (packed_rows, K)
-        # 0b00→0, 0b01→+1, 0b10→-1
-        vals = np.where(codes == 1, np.int8(1),
-               np.where(codes == 2, np.int8(-1), np.int8(0)))
-        weights[i::4, :] = vals
+        vals = codes.astype(np.int8) - np.int8(1)  # 0→-1, 1→0, 2→+1
+        start_row = i * packed_rows
+        weights[start_row:start_row + packed_rows, :] = vals
 
     return weights
 

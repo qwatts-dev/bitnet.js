@@ -1,199 +1,151 @@
 # BitNet WebGPU PoC
 
-An experimental proof-of-concept aimed at running 1-bit AI models (like Microsoft's BitNet b1.58) natively in JavaScript using WebGPU.
+An experimental proof-of-concept that runs Microsoft's [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T) (2 billion parameter, 1.58-bit ternary) large language model **entirely in the browser** using WebGPU — no server, no Python runtime, no WASM. Just JavaScript, WGSL shaders, and your GPU.
 
 ## The Goal
-Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which creates a massive memory bottleneck. This PoC explores rewriting the core mathematical kernels in WGSL (WebGPU Shading Language) to use ternary weights (-1, 0, 1). 
+Standard AI relies on heavy floating-point (`f32`) matrix multiplication, which creates a massive memory bottleneck. This PoC rewrites the core mathematical kernels in WGSL (WebGPU Shading Language) to use ternary weights (-1, 0, 1).
 
-By replacing complex multiplication with simple addition and subtraction directly on the GPU, we aim to drastically reduce memory bandwidth and make running massive Large Language Models in the browser a reality.
+By replacing complex multiplication with simple addition and subtraction directly on the GPU, we drastically reduce memory bandwidth and make running a 2B-parameter LLM in the browser a reality.
 
-## Current Status
-- [x] Initial repository setup
-- [x] WebGPU environment configuration
-- [x] WGSL compute shader for ternary math
-- [x] Browser-based execution via local web server
-- [x] Bit-packed weights (16 ternary values per u32)
-- [x] Branchless ternary arithmetic (no if/else, no select)
-- [x] 2D tiled mat-vec kernel using `var<workgroup>`
-- [x] Automated CPU vs GPU validation (PASS/FAIL)
-- [x] Stress-tested at 4096×4096 (~16.7M parameters)
-- [x] Isolated GPU setup vs compute timing
+## Current Status — v0.10.0: Coherent Text Generation
+
+The engine produces **coherent, grammatically correct English** through all 30 transformer layers. This is a full autoregressive inference engine — not a demo, not a single-layer proof.
+
+**Sample outputs** (prompt: "Hello"):
+> *Hello, my name is [Your Name], and I am a student here at your school. We are*
+
+> *Hello, welcome to the real world. I'm sorry if you're feeling lost." The customer looked around*
+
+**Performance:** ~191 ms/token on MacBook (M-series Apple Silicon)
+
+### Milestone Checklist
+- [x] WebGPU environment + WGSL compute shaders for ternary math
+- [x] Bit-packed weights (16 ternary values per `u32`) with branchless arithmetic
+- [x] 2D tiled mat-vec kernel using `var<workgroup>` shared memory
 - [x] Real AI weights from Hugging Face (`microsoft/bitnet-b1.58-2B-4T`)
-- [x] Tokenizer integration via Hugging Face `transformers.js` v4 (CDN, no bundler)
-- [x] Interactive UI — type text, click Compute, see real GPU output
-- [x] Cross-device determinism verified (iPhone / iPad / MacBook — bit-exact match)
-- [x] Migrated to standalone [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) (~8.3 kB gzipped)
-- [x] Browser Cache API (`fetchWithCache`) for instant repeat tokenizer loads
-- [x] Real embedding layer — sparse FP16 vocab slice (16,385 tokens, 80 MB)
-- [x] Mobile-optimised: iPhone / iPad / MacBook all load and run successfully
-- [x] Full SwiGLU MLP block — gate_proj + up_proj + SiLU·mul + down_proj (52.7M ternary params)
-- [x] SiLU activation WGSL compute shader for SwiGLU fusion
+- [x] Tokenizer via standalone [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) (~8.3 kB gzipped)
+- [x] Browser Cache API for instant repeat tokenizer loads
+- [x] Sparse FP16 embedding layer (16,385 tokens, 80 MB)
+- [x] Full ReLU²-gated MLP block — gate_proj + up_proj + ReLU²·mul + down_proj
 - [x] Unified GPU orchestration — single command encoder, zero CPU round-trips
-- [x] Cross-device bit-exact determinism verified (M2 Max / M3 iPad / A16 iPhone)
-- [x] LM Head — dense FP32 mat-vec maps MLP output to vocabulary logits (16,385 × 2,560)
-- [x] RMSNorm — CPU-side normalization prevents FP32 overflow in LM Head
-- [x] End-to-end text-in → word-out pipeline (Embed → MLP → RMSNorm → LM Head → Argmax → Decode)
-- [x] Adapter-aware WebGPU limits (requests hardware max `maxStorageBufferBindingSize`)
-- [x] Self-Attention block — RoPE positional encoding + Grouped-Query Attention (20 Q-heads, 5 KV-heads, GQA group size 4)
-- [x] KV cache — incremental key/value storage for autoregressive decoding (MAX_SEQ_LEN=128)
-- [x] Full single-layer transformer — Embed → RMSNorm → Self-Attention → Residual → RMSNorm → SwiGLU MLP → Residual → RMSNorm → LM Head
-- [x] Autoregressive generation loop with streaming token output
-- [x] LLM sampling pipeline — Temperature + Top-K + Top-P (nucleus) sampling
-- [x] Frequency-scaled repetition penalty — exponential `penalty^count` suppression of repeated tokens
-- [x] INT8/A8 activation quantization explored and parked (no hardware INT8 tensor ops in WebGPU yet)
-- [ ] Multi-layer inference pipeline (26 layers)
-- [ ] Real RMSNorm weights from model
+- [x] LM Head — dense FP16 mat-vec with tied embeddings (16,385 × 2,560)
+- [x] RMSNorm — CPU-side with learned γ weights (eps=1e-5)
+- [x] Self-Attention — RoPE (Llama-style rotate_half) + GQA (20 Q / 5 KV heads)
+- [x] KV cache — incremental key/value storage (MAX_SEQ_LEN=128)
+- [x] **Full 30-layer transformer** with correct residual connections
+- [x] **SubLN** — RMSNorm sub-norms after attention and after MLP activation (before O-proj and down-proj)
+- [x] **BitLinear weight_scale** — per-projection scalar multipliers from model config
+- [x] **Correct HF bit-packing** — contiguous-block row layout with `value+1` encoding
+- [x] Autoregressive generation with streaming token output
+- [x] LLM sampling — Temperature + Top-K + Top-P (nucleus) + frequency-scaled repetition penalty
+- [x] **Coherent multi-sentence English output**
 
-## How It Works
+## Architecture
 
-The WGSL compute shader receives an input vector and a ternary weight vector (`{-1, 0, +1}`). Instead of multiplying, it branches on each weight:
+### Model: `microsoft/bitnet-b1.58-2B-4T`
+
+| Parameter | Value |
+|-----------|-------|
+| Layers | 30 |
+| Hidden dim | 2,560 |
+| MLP intermediate dim | 6,912 |
+| Attention heads (Q) | 20 |
+| KV heads | 5 (GQA group size 4) |
+| Head dim | 128 |
+| Vocabulary | 128,256 (16,385 extracted) |
+| RoPE θ | 500,000 |
+| RMSNorm ε | 1e-5 |
+| Activation | ReLU² (squared ReLU) |
+| Weight format | 1.58-bit ternary {-1, 0, +1} |
+| Tie embeddings | Yes (embed_tokens = lm_head) |
+
+### Inference Pipeline
+
+```
+Token IDs → Embedding Lookup (FP16→F32)
+  ↓
+For each of 30 layers:
+  │  RMSNorm (input_layernorm, learned γ)
+  │  ↓
+  │  Self-Attention:
+  │    Q/K/V projections (ternary mat-vec × weight_scale)
+  │    → RoPE (Llama rotate_half, θ=500k)
+  │    → KV Cache update
+  │    → Grouped-Query Attention (20Q / 5KV)
+  │    → SubLN (attn_sub_norm, RMSNorm)
+  │    → O projection (ternary mat-vec × weight_scale)
+  │  ↓
+  │  Residual connection (+ input)
+  │  ↓
+  │  RMSNorm (post_attention_layernorm, learned γ)
+  │  ↓
+  │  MLP:
+  │    gate_proj + up_proj (ternary mat-vec × weight_scale)
+  │    → ReLU²(gate) ⊙ up
+  │    → SubLN (ffn_sub_norm, RMSNorm)
+  │    → down_proj (ternary mat-vec × weight_scale)
+  │  ↓
+  │  Residual connection (+ post-attn)
+  ↓
+Final RMSNorm (learned γ)
+  ↓
+LM Head (dense FP16 mat-vec, tied weights)
+  ↓
+Sampling (temp → top-k → top-p → repetition penalty)
+  ↓
+Decoded Token
+```
+
+### How Ternary Math Works
+
+The WGSL compute shader receives an input vector and ternary weights (`{-1, 0, +1}`). Instead of multiplying, it branches on each weight:
 
 | Weight | Operation | Cost |
 |--------|-----------|------|
-| `+1`   | Copy the input value | One add |
-| `-1`   | Negate the input value | One subtract |
-| `0`    | Output zero (skip) | Nothing |
+| `+1` | Copy the input value | One add |
+| `-1` | Negate the input value | One subtract |
+| `0` | Output zero (skip) | Nothing |
 
-This completely eliminates floating-point multiplication, which is the core insight behind BitNet b1.58.
+This completely eliminates floating-point multiplication — the core insight behind BitNet b1.58.
 
-### Bit-packing (2 bits per weight)
+### Bit-Packing (2 bits per weight)
 
-Weights are packed into `u32` buffers to reduce memory bandwidth:
+Weights are packed into `u32` buffers (16 values per word) to minimise memory bandwidth:
 
 | 2-bit code | Weight | Meaning |
 |------------|--------|---------|
-| `00`       | 0      | skip    |
-| `01`       | +1     | add     |
-| `10`       | -1     | subtract |
+| `00` | 0 | skip |
+| `01` | +1 | add |
+| `10` | -1 | subtract |
 
-The WGSL kernel unpacks 16 weights per `u32` and applies a branchless
-bitmask to include or exclude the input value.
+The WGSL kernel unpacks weights using branchless bitmasks — no warp divergence.
 
-### Branchless ternary math
+### HuggingFace Bit-Packing Format
 
-Instead of `if/else`, the kernel uses full-width bitmasks to select
-`+input`, `-input`, or `0` without warp divergence.
+The model stores weights as row-packed `uint8` tensors (4 ternary values per byte). The packing uses **contiguous blocks** (NOT interleaved rows) with a `+1` offset encoding:
 
-### 2D tiled mat-vec kernel
+| Stored code | Ternary value |
+|-------------|---------------|
+| `0` | -1 |
+| `1` | 0 |
+| `2` | +1 |
 
-For matrix-vector multiplication, input tiles are cached in
-`var<workgroup>` shared memory. Each workgroup computes one output row,
-and a reduction across the workgroup produces the final dot product.
+Bits `[1:0]` → rows `0..M/4-1`, bits `[3:2]` → rows `M/4..M/2-1`, bits `[5:4]` → rows `M/2..3M/4-1`, bits `[7:6]` → rows `3M/4..M-1`.
 
-### Tokenizer integration (v0.3.2)
+Our extraction scripts unpack from this HF format and re-pack into column-packed `uint32` (16 weights per word) for the WebGPU kernel.
 
-The Llama 3 tokenizer is loaded at runtime using the standalone
-[`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers)
-package (~8.3 kB gzipped) via CDN as a native ES module — no bundler
-required. This replaces the full `@huggingface/transformers` library
-(~1.2 MB) with a purpose-built tokenizer that is **~150× smaller**.
+### SubLN (Sub-Layer Normalization)
 
-Tokenizer config files (`tokenizer.json` and `tokenizer_config.json`)
-are fetched from the Hugging Face Hub and cached using the browser's
-standard Cache API (`caches.open('hf-tokenizer-cache')`), making repeat
-page loads instant.
+BitNet uses additional RMSNorm layers *within* the attention and MLP blocks (not present in standard Llama):
 
-### Real semantic embeddings (v0.4.0)
+- **attn_sub_norm** — applied to the concatenated attention output *before* the O projection
+- **ffn_sub_norm** — applied to ReLU²(gate)⊙up *before* the down projection
 
-The `extract_sparse_embeddings.py` script extracts the actual
-`model.embed_tokens.weight` tensor from
-[`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T).
-Since BPE tokenizers assign lower IDs to more frequent tokens, the first
-16,384 tokens cover ~99% of standard English. An extra row for token
-50991 ("WebGPU") is appended for domain-specific testing.
+These sub-norms are critical for training stability with ternary weights.
 
-The embedding vectors are stored in **Float16** to halve memory versus
-Float32, producing an **80 MB** binary file (down from 1.3 GB for the
-full Float32 vocabulary). A `vocab_map.json` maps original token IDs to
-dense row indices in the binary file.
+### RoPE (Rotary Position Embeddings)
 
-At runtime, the browser fetches both files in parallel. A lightweight
-`fp16ToNumber()` function converts each half-precision value to a
-standard JavaScript number. The raw 2,560-dimensional embedding is
-passed directly into the MLP pipeline.
-
-Tokens outside the 16K subset gracefully fall back to row 0 (OOV).
-
-**Pipeline:** text → tokenizer → vocab map lookup → FP16→F32 conversion →
-GPU SwiGLU MLP → output
-
-### Full SwiGLU MLP block (v0.5.0)
-
-The complete SwiGLU Multi-Layer Perceptron block for Layer 0:
-
-```
-embedding(2560) → gate_proj(6912) ─→ SiLU·mul(6912) → down_proj(2560)
-                → up_proj(6912)   ─┘
-```
-
-Three ternary weight matrices are extracted via `extract_full_mlp.py`,
-bit-packed (16 weights per `u32`), and served as static `.bin` files:
-- **gate_proj** — 6912×2560 (4,320 KB)
-- **up_proj** — 6912×2560 (4,320 KB)
-- **down_proj** — 2560×6912 (4,320 KB)
-
-### Unified GPU orchestration (v0.5.0)
-
-All four compute passes (gate matmul, up matmul, SiLU·multiply, down
-matmul) execute in a **single WebGPU command encoder submission**.
-Intermediate tensors (`gate_out`, `up_out`, `silu_out`) are GPU-only
-buffers that never leave VRAM — eliminating the GPU↔CPU "ping-pong"
-that previously added ~35ms of transfer latency per step.
-
-**Before (separate submissions):** 55.1ms
-**After (unified):** 7.2ms on M2 Max
-
-### Self-Attention with RoPE & GQA (v0.7.0)
-
-Full self-attention for Layer 0 using Grouped-Query Attention:
-
-- **RoPE** — Rotary Position Embeddings computed via a WGSL shader (`SHADER_ROPE_CACHE`), applied to Q and K vectors for position-aware attention.
-- **GQA** — 20 query heads share 5 KV heads (group size 4), reducing KV memory by 4×.
-- **KV Cache** — Incremental key/value buffers (MAX_SEQ_LEN=128) enable autoregressive decoding without recomputing past tokens.
-- **6 GPU passes per step:** Q/K/V/O projections (ternary mat-vec) + RoPE application + GQA attention kernel.
-
-Attention weights extracted via `extract_attention.py`:
-- **q_proj** — 2560×2560 (1,280 KB)
-- **k_proj** — 640×2560 (320 KB)
-- **v_proj** — 640×2560 (320 KB)
-- **o_proj** — 2560×2560 (1,280 KB)
-
-### Autoregressive generation with LLM sampling (v0.9.0)
-
-The `generateText()` function implements a full autoregressive decode loop:
-
-1. **Prefill** — feed each prompt token through the transformer to build the KV cache.
-2. **Decode** — sample one token at a time, feed it back into the model, repeat.
-3. **Streaming** — an `onToken` callback delivers each decoded token as it's generated.
-
-**Sampling pipeline** (`sampleToken`):
-- **Frequency-scaled repetition penalty** — each previously generated token has its logit penalised by `penalty^count` (default penalty=1.5). Positive logits are divided, negative logits are multiplied, so repeated tokens become exponentially less likely.
-- **Temperature scaling** — controls randomness (default 1.0).
-- **Top-K** — keeps only the K highest-probability tokens (default 50).
-- **Top-P (nucleus)** — keeps tokens until cumulative probability reaches P (default 0.9).
-- **Weighted random sampling** from the surviving distribution.
-
-**Performance:** ~43 ms/token on M2 Max (1 of 26 layers).
-
-### INT8/A8 activation quantization (explored, parked)
-
-A `SHADER_2D_TILED_A8` shader was built implementing W1.58A8 — ternary
-weights with dynamic INT8 activation quantization (abs_max scan →
-quantize → integer dot product → dequantize). Testing on M2 Max showed
-no performance benefit since current WebGPU implementations lack
-hardware INT8 tensor ops (like DP4a). The shader is preserved in
-`bitnet-kernel.js` as a commented-out reference for future use when
-WebGPU gains INT8 intrinsics.
-
-### Real AI weight integration
-
-The `extract_full_mlp.py` script downloads pre-trained weights from
-[`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-on Hugging Face. The model stores weights as row-packed `uint8` tensors
-(4 ternary values per byte). The script unpacks all three MLP matrices
-(gate_proj, up_proj, down_proj), then re-packs into our kernel's
-column-packed `uint32` format (16 weights per `u32`) and saves `.bin`
-files that the browser can `fetch()` directly into GPU buffers.
+Uses the **Llama-style `rotate_half`** convention: dimension `d` is paired with `d + head_dim/2` within each head (NOT the GPT-NeoX interleaved `d, d+1` pairing). With `θ = 500,000` for the extended context window.
 
 ## Quick Start
 
@@ -203,215 +155,121 @@ files that the browser can `fetch()` directly into GPU buffers.
    cd bitnet-webgpu-poc
    ```
 
-2. **Start a local web server**
+2. **Extract model weights** (requires Python 3.10+)
+   ```bash
+   pip install torch safetensors huggingface-hub numpy accelerate transformers
+   ```
+
+   Run the extraction scripts in order:
+   ```bash
+   python extract_sparse_embeddings.py   # Embeddings (80 MB)
+   python extract_lm_head.py             # LM Head (80 MB, tied weights)
+   python extract_all_layers.py          # All 30 layers (497 MB, 210 files)
+   python extract_rmsnorm.py             # RMSNorm weights (31 files)
+   python extract_sub_norms.py           # SubLN weights (60 files)
+   python extract_weight_scales.py       # Per-projection weight_scale values
+   ```
+
+   This produces:
+   - `sparse_embeddings.bin` + `vocab_map.json` — sparse FP16 embedding slice
+   - `sparse_lm_head.bin` — FP16 LM head (tied to embeddings)
+   - `weights/bitnet_layer_{i}_{proj}.bin` — 7 ternary weight files × 30 layers
+   - `weights/bitnet_layer_{i}_attn_norm.bin` + `_mlp_norm.bin` — learned RMSNorm γ
+   - `weights/bitnet_layer_{i}_attn_sub_norm.bin` + `_ffn_sub_norm.bin` — SubLN γ
+   - `weights/bitnet_layer_scales.json` — per-projection weight_scale values
+   - `weights/bitnet_final_norm.bin` — final layer RMSNorm γ
+
+3. **Start a local web server**
    ```bash
    npx serve . -l 8080
    ```
 
-3. **Open in a WebGPU-capable browser** (Chrome 113+, Edge 113+, Safari 18+)
-   
-   Navigate to `http://localhost:8080` — the page will automatically run the ternary-weight compute shader on your GPU and display the results. Tests 1 and 2 run CPU-vs-GPU validation with synthetic data. Test 3 runs a real AI weight matrix through the WebGPU kernel.
+4. **Open in a WebGPU-capable browser** (Chrome 113+, Edge 113+, Safari 18+)
+
+   Navigate to `http://localhost:8080` — type a prompt and generate text.
 
 ## Testing on Mobile Devices (iPhone / iPad)
 
-WebGPU requires a **secure context** (`https://`). Browsers make a special exception for `localhost`, but if you try to access your MacBook via its local IP address (e.g. `http://192.168.1.X:8080`), mobile Safari/Chrome will block WebGPU.
+WebGPU requires a **secure context** (`https://`). Use [Cloudflare Tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) for quick HTTPS access:
 
-The fastest solution is **Cloudflare Tunnels**, which creates a temporary `https://` tunnel from the internet to your local server.
+```bash
+# Terminal 1: local server
+npx serve . -l 8080
 
-1. **Keep your local server running** in one terminal:
-   ```bash
-   npx serve . -l 8080
-   ```
+# Terminal 2: HTTPS tunnel
+npx cloudflared tunnel --url http://localhost:8080
+```
 
-2. **Open a second terminal** and start cloudflared:
-   ```bash
-   npx cloudflared tunnel --url http://localhost:8080
-   ```
-
-3. **Copy the secure URL** from the cloudflared output. Look for the line containing `trycloudflare.com`:
-   ```
-   https://your-random-subdomain.trycloudflare.com
-   ```
-
-4. **Open that `https://` URL** on your iPhone or iPad.
-   - WebGPU will be fully enabled because the connection is `https`.
-   - The `.bin` weight files are served directly from your MacBook over your local network — nothing is uploaded to the internet.
-   - First load will take a few seconds as the ~175 MB of weight files transfer over Wi-Fi.
-
-> **Note:** You can use `npx` for zero-install one-off usage. A free Cloudflare tunnel is sufficient — the only limitation is a random subdomain that changes each session.
-
-## Extracting Real AI Weights (Optional)
-
-To reproduce the real-weight integration (Test 3), you need Python 3.10+ and (optionally) a Hugging Face account:
-
-1. **Install Python dependencies**
-   ```bash
-   pip install torch safetensors huggingface-hub numpy
-   ```
-
-2. **Run the full MLP weight extraction script**
-   ```bash
-   python extract_full_mlp.py
-   ```
-   This will:
-   - Download `microsoft/bitnet-b1.58-2B-4T` (~1.1 GB safetensors file)
-   - Extract all 3 Layer 0 MLP matrices: gate_proj (6912×2560), up_proj (6912×2560), down_proj (2560×6912)
-   - Unpack the HF row-packed `uint8` format (4 weights/byte)
-   - Re-pack into our JS kernel's column-packed `uint32` format (16 weights/u32)
-   - Save `bitnet_layer_0_gate_proj.bin`, `bitnet_layer_0_up_proj.bin`, `bitnet_layer_0_down_proj.bin` (~4.3 MB each)
-
-3. **Run the sparse embedding extraction script**
-   ```bash
-   python extract_sparse_embeddings.py
-   ```
-   This will:
-   - Extract `model.embed_tokens.weight` (128,256 × 2,560, bfloat16)
-   - Slice the first 16,384 tokens (BPE frequency-ordered) + token 50991 ("WebGPU")
-   - Convert to Float16
-   - Save `sparse_embeddings.bin` (80 MB) and `vocab_map.json` (202 KB)
-
-4. **Run the LM head extraction script**
-   ```bash
-   python extract_lm_head.py
-   ```
-   This will:
-   - Extract `model.embed_tokens.weight` (the model uses tied embeddings — the embedding matrix doubles as the LM head)
-   - Apply the exact same vocab-slice as the embeddings (rows 0–16,383 + row 50,991)
-   - Convert to Float16
-   - Save `sparse_lm_head.bin` (80 MB)
-
-5. **Serve and test** — all `.bin` and `.json` files must be in the same directory as `index.html`:
-   ```bash
-   npx serve . -l 8080
-   ```
-
-## Latest Benchmark Results
-
-### Test 2: Synthetic 4096×4096 mat-vec (CPU vs GPU validation)
-
-| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
-|--------|-------------------|-------------|----------------|
-| CPU mat-vec | 78 ms | 71 ms | 93 ms |
-| GPU setup | 84 ms | 73 ms | 98 ms |
-| GPU compute | **50 ms** | **24 ms** | **3.1 ms** |
-| Speedup | **1.6×** | **3.0×** | **30.1×** |
-| Max error | 2.08e-3 | 2.08e-3 | 2.08e-3 |
-
-### Test 3: Real AI weights — `microsoft/bitnet-b1.58-2B-4T`
-
-Layer: `model.layers.0.mlp.down_proj` (2560 × 6912 = 17.7M ternary params)
-
-| Metric | iPhone 14 Pro Max | iPad Air M3 | MacBook M2 Max |
-|--------|-------------------|-------------|----------------|
-| GPU setup | 2 ms | 1 ms | 1.4 ms |
-| GPU compute | **13 ms** | **7 ms** | **4.8 ms** |
-| Non-zero outputs | 2560/2560 (100%) | 2560/2560 (100%) | 2560/2560 (100%) |
-| Result | ✅ PASS | ✅ PASS | ✅ PASS |
-
-### Interactive mode: Full SwiGLU MLP pipeline (v0.5.0)
-
-Input run through the complete SwiGLU pipeline: `@huggingface/tokenizers` encode → sparse FP16 vocab lookup → FP16→F32 conversion → unified GPU SwiGLU MLP (gate_proj → up_proj → SiLU·mul → down_proj).
-
-**"Hello"** (1 token, ID 9906) — 52.7M ternary parameters, 4 compute passes
-
-| Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
-|--------|-------------------|-------------|----------------|
-| 1st run (cold JIT) | 378 ms | 361 ms | 21.2 ms |
-| 2nd run | 68 ms | 30 ms | 16.2 ms |
-| Warmed (3rd/4th) | **38 ms** | **18 ms** | **7.2 ms** |
-| output[2559] | -106371.250000 | -106371.250000 | -106371.250000 |
-| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
-
-**Warmed cache breakdown:**
-
-| | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
-|---|---|---|---|
-| Setup (buffers + pipelines) | 9.0 ms | 2.0 ms | 0.8 ms |
-| Compute (submit + readback) | 29.0 ms | 16.0 ms | 6.4 ms |
-
-**Asset load times** (sparse_embeddings.bin 80 MB + 3× MLP .bin files ~13 MB):
-
-| | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
-|---|---|---|---|
-| First load | ~12 s | ~10 s | ~10 s |
-| Cached (304) | < 2 s | < 2 s | < 1 s |
-
-**Key takeaways:**
-
-- **Complete SwiGLU MLP block.** The full gate_proj + up_proj + SiLU·mul + down_proj pipeline runs with real ternary weights from `microsoft/bitnet-b1.58-2B-4T`.
-- **Unified GPU orchestration.** All 4 compute passes run in a single command encoder submission — intermediate tensors never leave VRAM. This eliminated ~35ms of GPU↔CPU transfer latency.
-- **Metal JIT compilation.** First-run times (350ms+ on mobile) are entirely shader compilation. Apple's Metal backend caches the compiled GPU code — subsequent runs drop to steady-state speeds.
-- **Cross-device determinism.** All output values match to 6 decimal places across iPhone (A16), iPad (M3), and MacBook (M2 Max). The branchless, bit-packed kernel produces identical IEEE 754 results regardless of GPU architecture.
-- **Mobile-friendly.** FP16 sparse vocab slice (80 MB) loads cleanly on all devices — previously the 1.3 GB Float32 file crashed iOS Safari.
-- **M2 Max processes 52.7M ternary parameters in 7.2ms** — ~140 MLP blocks/second.
-- **iPhone processes the same in 38ms** — well within interactive latency for a phone.
-
-### End-to-end prediction: Embed → MLP → RMSNorm → LM Head → Decode (v0.6.0)
-
-Full pipeline: `@huggingface/tokenizers` encode → sparse FP16 embedding → unified GPU SwiGLU MLP → CPU RMSNorm → GPU dense LM Head (16,385 × 2,560) → argmax → reverse vocab map → tokenizer decode.
-
-**"Hello"** (1 token, ID 9906) — first word prediction
-
-| Metric | iPhone 14 Pro Max | iPad 13" M3 | MacBook M2 Max |
-|--------|-------------------|-------------|----------------|
-| maxStorageBufferBindingSize | 1024 MB | 1024 MB | 4096 MB |
-| MLP Compute | 37 ms | 23 ms | 34 ms |
-| LM Head Compute | 338 ms | 255 ms | 74.5 ms |
-| **Total Compute** | **375 ms** | **278 ms** | **108.5 ms** |
-| Predicted word | `" volume"` | `" volume"` | `" volume"` |
-| Token ID | 8286 | 8286 | 8286 |
-| Logit | 207.9285 | 207.9285 | 207.9285 |
-| Deterministic | ✅ Bit-exact | ✅ Bit-exact | ✅ Bit-exact |
-
-**Top 5 predictions (all devices identical):**
-
-| Rank | Word | Token ID | Logit |
-|------|------|----------|-------|
-| 1 | volume | 8286 | 207.93 |
-| 2 | Count | 4605 | — |
-| 3 | mass | 3148 | — |
-| 4 | Mass | 9346 | — |
-| 5 | Ma | 11583 | — |
-
-**Key takeaways:**
-
-- **End-to-end text → word.** The complete pipeline — embedding lookup, ternary SwiGLU MLP, RMSNorm, dense LM Head, argmax decode — produces a real English word on all three devices.
-- **Semantic coherence.** All top-5 predictions (volume, Count, mass, Mass, Ma) cluster around measurement/quantity concepts, demonstrating the network's learned weight structure produces meaningful semantic groupings even through a single MLP layer without attention.
-- **Adapter-aware limits.** By requesting `adapter.limits.maxStorageBufferBindingSize`, all devices successfully allocated the 160 MB LM Head buffer (default spec limit is 128 MB).
-- **RMSNorm prevents overflow.** The MLP outputs ~564,000-scale values. Without normalization, these overflow FP32 dot products in the LM Head → NaN → 0.0. The CPU-side RMSNorm squishes to ~4.09 max, enabling safe computation.
-- **Cross-device bit-exact determinism.** Token ID 8286, logit 207.9285 — identical across A16, M3, and M2 Max.
-- **iPhone handles 160 MB GPU buffer.** The A16 Bionic granted 1024 MB of storage buffer space — no OOM crashes.
-- **M2 Max wider memory bus shows on dense mat-vec.** The M3 iPad beats the M2 Max on ternary MLP (23ms vs 34ms) but the M2 Max dominates the dense FP32 LM Head (74ms vs 255ms) thanks to its wider memory bandwidth.
+Open the `https://...trycloudflare.com` URL on your mobile device.
 
 ## Project Structure
 
 | File | Description |
 |------|-------------|
-| `index.html` | Page with interactive text input panel and automated test log |
-| `bitnet-kernel.js` | WebGPU setup, WGSL shaders, tokenizer integration, FP16 embedding loader, interactive handler, and validation |
-| `extract_weights.py` | Python script to extract and bit-pack ternary weights from Hugging Face (single layer) |
-| `extract_full_mlp.py` | Python script to extract & pack all 3 MLP weight matrices (gate, up, down) |
-| `extract_sparse_embeddings.py` | Python script to extract sparse FP16 embedding vocab slice + vocab map |
-| `extract_lm_head.py` | Python script to extract vocab-sliced FP16 LM head weights (tied embeddings) |
-| `extract_attention.py` | Python script to extract & pack attention weight matrices (Q, K, V, O projections) |
-| `bitnet_layer_0_gate_proj.bin` | Pre-packed ternary weight binary for gate_proj (generated by `extract_full_mlp.py`) |
-| `bitnet_layer_0_up_proj.bin` | Pre-packed ternary weight binary for up_proj (generated by `extract_full_mlp.py`) |
-| `bitnet_layer_0_down_proj.bin` | Pre-packed ternary weight binary for down_proj (generated by `extract_full_mlp.py`) |
-| `sparse_embeddings.bin` | FP16 embedding dictionary — 16,385 rows × 2,560 dims (generated by `extract_sparse_embeddings.py`) |
-| `vocab_map.json` | Token ID → dense row index mapping (generated by `extract_sparse_embeddings.py`) |
-| `sparse_lm_head.bin` | FP16 LM head weights — 16,385 rows × 2,560 dims (generated by `extract_lm_head.py`) |
-| `bitnet_layer_0_q_proj.bin` | Pre-packed ternary weight binary for Q projection (generated by `extract_attention.py`) |
-| `bitnet_layer_0_k_proj.bin` | Pre-packed ternary weight binary for K projection (generated by `extract_attention.py`) |
-| `bitnet_layer_0_v_proj.bin` | Pre-packed ternary weight binary for V projection (generated by `extract_attention.py`) |
-| `bitnet_layer_0_o_proj.bin` | Pre-packed ternary weight binary for O projection (generated by `extract_attention.py`) |
-| `package.json` | Project metadata |
+| `index.html` | Interactive UI — prompt input, streaming token output, sampling controls |
+| `bitnet-kernel.js` | Complete WebGPU inference engine — WGSL shaders, 30-layer transformer, tokenizer, generation loop |
+| **Extraction Scripts** | |
+| `extract_all_layers.py` | Main extractor — all 7 ternary weight matrices × 30 layers (210 files) |
+| `extract_rmsnorm.py` | RMSNorm learned γ weights (input_layernorm, post_attention_layernorm, final_norm) |
+| `extract_sub_norms.py` | SubLN γ weights (attn_sub_norm, ffn_sub_norm) |
+| `extract_weight_scales.py` | Per-projection weight_scale scalars from BitLinear layers |
+| `extract_sparse_embeddings.py` | Sparse FP16 embedding slice (16,385 of 128,256 tokens) + vocab map |
+| `extract_lm_head.py` | FP16 LM head (tied to embed_tokens) |
+| `extract_attention.py` | Single-layer attention weight extractor (legacy, superseded by `extract_all_layers.py`) |
+| `extract_full_mlp.py` | Single-layer MLP weight extractor (legacy, superseded by `extract_all_layers.py`) |
+| `extract_weights.py` | Single-matrix weight extractor (legacy, superseded by `extract_all_layers.py`) |
+| **Runtime Assets** *(gitignored — generated by extraction scripts)* | |
+| `sparse_embeddings.bin` | FP16 embeddings — 16,385 rows × 2,560 dims (80 MB) |
+| `vocab_map.json` | Token ID → dense row index mapping |
+| `sparse_lm_head.bin` | FP16 LM head — 16,385 rows × 2,560 dims (80 MB) |
+| `weights/` | 331 binary files — ternary weights, norms, sub-norms, scales (~500 MB total) |
+
+## Key Technical Details
+
+### Weight Files Per Layer (11 files × 30 layers = 330 + 1 final norm = 331)
+
+| File | Shape | Size | Type |
+|------|-------|------|------|
+| `q_proj` | 2560×2560 | 819 KB | Ternary (packed u32) |
+| `k_proj` | 640×2560 | 205 KB | Ternary (packed u32) |
+| `v_proj` | 640×2560 | 205 KB | Ternary (packed u32) |
+| `o_proj` | 2560×2560 | 819 KB | Ternary (packed u32) |
+| `gate_proj` | 6912×2560 | 2,211 KB | Ternary (packed u32) |
+| `up_proj` | 6912×2560 | 2,211 KB | Ternary (packed u32) |
+| `down_proj` | 2560×6912 | 2,211 KB | Ternary (packed u32) |
+| `attn_norm` | 2560 | 10 KB | FP16 |
+| `mlp_norm` | 2560 | 10 KB | FP16 |
+| `attn_sub_norm` | 2560 | 10 KB | FP16 |
+| `ffn_sub_norm` | 6912 | 27 KB | FP16 |
+
+### GPU Passes Per Token Per Layer
+
+| Pass | Operation | Dimensions |
+|------|-----------|------------|
+| 1–3 | Q/K/V projections (ternary mat-vec) | 2560/640/640 × 2560 |
+| 4 | RoPE + KV cache + GQA attention | 20 heads × 128 dim |
+| 5 | SubLN (attn_sub_norm) | 2560 |
+| 6 | O projection (ternary mat-vec) | 2560 × 2560 |
+| 7–8 | Gate + Up projections (ternary mat-vec) | 6912 × 2560 |
+| 9 | ReLU² · element-wise multiply + SubLN | 6912 |
+| 10 | Down projection (ternary mat-vec) | 2560 × 6912 |
+
+**Total: 10 GPU passes × 30 layers = 300 GPU dispatches per token**
 
 ## Dependencies
 
-| Dependency | How it's used | Loaded via |
+| Dependency | Purpose | Loaded via |
 |---|---|---|
-| [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) v0.1.1 | Llama 3 tokenizer (`Tokenizer`) — ~8.3 kB gzipped | CDN ES module import (no install needed) |
-| [`Xenova/llama3-tokenizer`](https://huggingface.co/Xenova/llama3-tokenizer) | `tokenizer.json` + `tokenizer_config.json` | Fetched at runtime from Hugging Face Hub, cached via Cache API |
+| [`@huggingface/tokenizers`](https://www.npmjs.com/package/@huggingface/tokenizers) v0.1.1 | Llama 3 BPE tokenizer (~8.3 kB gzipped) | CDN ES module import |
+| [`Xenova/llama3-tokenizer`](https://huggingface.co/Xenova/llama3-tokenizer) | `tokenizer.json` + `tokenizer_config.json` | Fetched at runtime, cached via Cache API |
+
+## Known Limitations
+
+- **Sparse vocabulary** — only 16,385 of 128,256 tokens are extracted (covers ~99% of standard English via BPE frequency ordering). Token 128000 (BOS) falls back to row 0.
+- **No BOS token** — the BOS token ID 128000 is outside the extracted vocabulary slice. Generation starts without it.
+- **FP16 precision** — embeddings and LM head use FP16 (vs BF16 in the original model). Maximum error is negligible (~3e-8).
+- **Sequence length** — KV cache is limited to 128 tokens.
+- **No batching** — single-sequence inference only.
 
 ## License
-This project is licensed under the MIT License - free and open for anyone to contribute, fork, and hack on!
+This project is licensed under the MIT License — free and open for anyone to contribute, fork, and hack on!
