@@ -53,12 +53,29 @@ let embeddingData   = null;   // Uint16Array – FP16 sparse embed_tokens
 let vocabMap        = null;   // Object – original token ID → dense row index
 let lmHeadWeights   = null;   // Float32Array – dense LM head (vocab-sliced)
 let reverseVocabMap = null;   // Object – dense row index → original token ID
+let qProjWeights    = null;   // Uint32Array – packed q_proj  (2560×2560)
+let kProjWeights    = null;   // Uint32Array – packed k_proj  (640×2560)
+let vProjWeights    = null;   // Uint32Array – packed v_proj  (640×2560)
+let oProjWeights    = null;   // Uint32Array – packed o_proj  (2560×2560)
+let kCacheBuf       = null;   // GPUBuffer – persistent KV cache (K)
+let vCacheBuf       = null;   // GPUBuffer – persistent KV cache (V)
+let seqPos          = 0;      // current token position in sequence
 const HIDDEN_DIM    = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 const MLP_DIM       = 6912;   // intermediate_size (SwiGLU)
 const REAL_M        = 2560;   // rows  (down_proj output dim) — kept for Test 3
 const REAL_K        = 6912;   // cols  (down_proj input  dim) — kept for Test 3
 const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
 const LM_HEAD_ROWS  = 16385;  // vocab-sliced rows (16384 + 1 for "WebGPU")
+
+// ── Self-Attention architecture constants ──
+const NUM_Q_HEADS    = 20;           // query heads
+const NUM_KV_HEADS   = 5;            // key/value heads (GQA 4:1)
+const HEAD_DIM       = 128;          // dimension per head
+const GQA_GROUP_SIZE = NUM_Q_HEADS / NUM_KV_HEADS;  // 4
+const Q_DIM          = NUM_Q_HEADS  * HEAD_DIM;      // 2560
+const KV_DIM         = NUM_KV_HEADS * HEAD_DIM;      // 640
+const MAX_SEQ_LEN    = 128;          // max tokens in KV cache
+const ROPE_THETA     = 10000.0;      // RoPE base frequency
 
 /**
  * Fetch a URL using the browser Cache API so repeated loads are instant.
@@ -647,6 +664,209 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let silu = gate / (1.0 + exp(-gate));
 
   result_vec[idx] = silu * up;
+}
+`;
+
+// ════════════════════════════════════════════════
+// 5d. WGSL – RoPE + KV Cache Write
+// ════════════════════════════════════════════════
+//
+//  Applies Rotary Positional Embeddings to Q and K vectors,
+//  then writes the rotated K and raw V into the persistent
+//  KV cache at the current sequence position.
+//
+//  Dispatch: ceil(Q_DIM / 2 / WORKGROUP_SIZE) workgroups.
+//  Each thread handles one consecutive dimension pair (2i, 2i+1).
+
+const SHADER_ROPE_CACHE = /* wgsl */ `
+
+struct RoPEParams {
+  seq_pos:  u32,     // current position in sequence
+  q_dim:    u32,     // total Q dimensions (2560)
+  kv_dim:   u32,     // total KV dimensions (640)
+  head_dim: u32,     // dimension per head (128)
+}
+
+@group(0) @binding(0) var<storage, read_write> q_vec:   array<f32>;
+@group(0) @binding(1) var<storage, read_write> k_vec:   array<f32>;
+@group(0) @binding(2) var<storage, read>       v_vec:   array<f32>;
+@group(0) @binding(3) var<storage, read_write> k_cache: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v_cache: array<f32>;
+@group(0) @binding(5) var<uniform>             params:  RoPEParams;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let pair_idx = gid.x;
+  let q_pairs  = params.q_dim  / 2u;   // 1280
+  let kv_pairs = params.kv_dim / 2u;   // 320
+
+  if (pair_idx >= q_pairs) { return; }
+
+  let pos       = f32(params.seq_pos);
+  let half_head = params.head_dim / 2u;
+
+  // ── Apply RoPE to Q ──
+  {
+    let dim_pair = pair_idx % half_head;
+    let freq     = 1.0 / pow(${ROPE_THETA}, f32(dim_pair * 2u) / f32(params.head_dim));
+    let theta    = pos * freq;
+    let cos_t    = cos(theta);
+    let sin_t    = sin(theta);
+
+    let i0 = pair_idx * 2u;
+    let i1 = i0 + 1u;
+    let q0 = q_vec[i0];
+    let q1 = q_vec[i1];
+    q_vec[i0] = q0 * cos_t - q1 * sin_t;
+    q_vec[i1] = q0 * sin_t + q1 * cos_t;
+  }
+
+  // ── Apply RoPE to K + write KV cache ──
+  if (pair_idx < kv_pairs) {
+    let dim_pair = pair_idx % half_head;
+    let freq     = 1.0 / pow(${ROPE_THETA}, f32(dim_pair * 2u) / f32(params.head_dim));
+    let theta    = pos * freq;
+    let cos_t    = cos(theta);
+    let sin_t    = sin(theta);
+
+    let i0 = pair_idx * 2u;
+    let i1 = i0 + 1u;
+    let k0 = k_vec[i0];
+    let k1 = k_vec[i1];
+    let k0r = k0 * cos_t - k1 * sin_t;
+    let k1r = k0 * sin_t + k1 * cos_t;
+
+    // Write rotated K into cache at current position
+    let cache_off = params.seq_pos * params.kv_dim;
+    k_cache[cache_off + i0] = k0r;
+    k_cache[cache_off + i1] = k1r;
+
+    // Write raw V into cache (no RoPE on V)
+    v_cache[cache_off + i0] = v_vec[i0];
+    v_cache[cache_off + i1] = v_vec[i1];
+  }
+}
+`;
+
+// ════════════════════════════════════════════════
+// 5e. WGSL – Grouped-Query Attention (GQA)
+// ════════════════════════════════════════════════
+//
+//  20 Query heads share 5 Key/Value heads (4:1 GQA ratio).
+//  Computes scaled dot-product attention across the KV cache:
+//    softmax((Q @ K^T) / sqrt(head_dim)) @ V
+//
+//  Dispatch: NUM_Q_HEADS (20) workgroups, WG_SIZE = HEAD_DIM (128).
+//  Each workgroup handles one query head with 1 thread per dimension.
+
+const SHADER_GQA_ATTENTION = /* wgsl */ `
+
+const WG_ATTN: u32   = ${HEAD_DIM}u;
+const MAX_SEQ: u32   = ${MAX_SEQ_LEN}u;
+const GQA_GROUP: u32 = ${GQA_GROUP_SIZE}u;
+
+struct AttnParams {
+  seq_len:     u32,   // tokens in cache (seq_pos + 1)
+  kv_dim:      u32,   // 640
+  head_dim:    u32,   // 128
+  num_q_heads: u32,   // 20
+}
+
+@group(0) @binding(0) var<storage, read>       q_vec:    array<f32>;
+@group(0) @binding(1) var<storage, read>       k_cache:  array<f32>;
+@group(0) @binding(2) var<storage, read>       v_cache:  array<f32>;
+@group(0) @binding(3) var<storage, read_write> attn_out: array<f32>;
+@group(0) @binding(4) var<uniform>             params:   AttnParams;
+
+var<workgroup> scores: array<f32, ${MAX_SEQ_LEN}>;
+var<workgroup> temp:   array<f32, ${HEAD_DIM}>;
+
+@compute @workgroup_size(${HEAD_DIM})
+fn main(
+  @builtin(workgroup_id)        wid: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+) {
+  let head_id = wid.x;
+  let tid     = lid.x;
+
+  if (head_id >= params.num_q_heads) { return; }
+
+  let kv_head   = head_id / GQA_GROUP;
+  let q_offset  = head_id * params.head_dim;
+  let kv_offset = kv_head * params.head_dim;
+  let scale     = 1.0 / sqrt(f32(params.head_dim));
+
+  // ── Phase 1: Compute attention scores for each cached position ──
+  for (var p: u32 = 0u; p < params.seq_len; p = p + 1u) {
+    let q_val = q_vec[q_offset + tid];
+    let k_val = k_cache[p * params.kv_dim + kv_offset + tid];
+    temp[tid] = q_val * k_val;
+    workgroupBarrier();
+
+    // Binary reduction (sum 128 → 1)
+    for (var s: u32 = WG_ATTN / 2u; s > 0u; s = s >> 1u) {
+      if (tid < s) {
+        temp[tid] = temp[tid] + temp[tid + s];
+      }
+      workgroupBarrier();
+    }
+
+    if (tid == 0u) {
+      scores[p] = temp[0] * scale;
+    }
+    workgroupBarrier();
+  }
+
+  // ── Phase 2: Softmax over scores[0 .. seq_len-1] ──
+  // 2a: Find max (numerical stability)
+  if (tid < params.seq_len) {
+    temp[tid] = scores[tid];
+  } else {
+    temp[tid] = -3.402823e+38;
+  }
+  workgroupBarrier();
+
+  for (var s: u32 = WG_ATTN / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      temp[tid] = max(temp[tid], temp[tid + s]);
+    }
+    workgroupBarrier();
+  }
+  let max_score = temp[0];
+  workgroupBarrier();
+
+  // 2b: exp(score - max) and sum
+  if (tid < params.seq_len) {
+    temp[tid] = exp(scores[tid] - max_score);
+    scores[tid] = temp[tid];
+  } else {
+    temp[tid] = 0.0;
+  }
+  workgroupBarrier();
+
+  for (var s: u32 = WG_ATTN / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      temp[tid] = temp[tid] + temp[tid + s];
+    }
+    workgroupBarrier();
+  }
+  let sum_exp = temp[0];
+  workgroupBarrier();
+
+  // 2c: Normalize
+  if (tid < params.seq_len) {
+    scores[tid] = scores[tid] / sum_exp;
+  }
+  workgroupBarrier();
+
+  // ── Phase 3: Weighted V sum ──
+  var out_val: f32 = 0.0;
+  for (var p: u32 = 0u; p < params.seq_len; p = p + 1u) {
+    let v_val = v_cache[p * params.kv_dim + kv_offset + tid];
+    out_val = out_val + scores[p] * v_val;
+  }
+
+  attn_out[q_offset + tid] = out_val;
 }
 `;
 
@@ -1455,6 +1675,334 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
 }
 
 // ════════════════════════════════════════════════
+// 8d. Self-Attention – Unified 6-Pass GPU Pipeline
+// ════════════════════════════════════════════════
+//
+//  Pass 1: q_vec  = q_proj  × input   (2560 × 2560 → 2560)
+//  Pass 2: k_vec  = k_proj  × input   (640  × 2560 → 640)
+//  Pass 3: v_vec  = v_proj  × input   (640  × 2560 → 640)
+//  Pass 4: RoPE(q, k) + write k,v to KV cache
+//  Pass 5: GQA Attention (20 Q heads, 5 KV heads)
+//  Pass 6: result = o_proj  × attn_out (2560 × 2560 → 2560)
+//
+//  All intermediate buffers stay in VRAM.  Single command encoder.
+
+/**
+ * Run the full Self-Attention block on the GPU.
+ *
+ * @param {GPUDevice}    device      – WebGPU device
+ * @param {Uint32Array}  qW          – packed q_proj weights
+ * @param {Uint32Array}  kW          – packed k_proj weights
+ * @param {Uint32Array}  vW          – packed v_proj weights
+ * @param {Uint32Array}  oW          – packed o_proj weights
+ * @param {Float32Array} inputVec    – normed hidden state (length HIDDEN_DIM)
+ * @param {number}       seqPosition – current position in KV cache
+ * @returns {{ results: Float32Array, setupMs: number, computeMs: number, newSeqPos: number }}
+ */
+async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
+  const setupT0 = performance.now();
+
+  const qStride = Math.ceil(HIDDEN_DIM / 16);  // Q: K = 2560, stride = 160
+  const kStride = Math.ceil(HIDDEN_DIM / 16);  // K/V: K = 2560, stride = 160
+  const oStride = Math.ceil(Q_DIM / 16);       // O: K = 2560, stride = 160
+
+  // ── Shared input buffer (uploaded once) ────────────────
+  const inputBuf = device.createBuffer({
+    label: "attn-input",
+    size:  HIDDEN_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(inputBuf, 0, new Float32Array(inputVec));
+
+  // ── Weight buffers ─────────────────────────────────────
+  const qWeightBuf = device.createBuffer({
+    label: "attn-q-weights",
+    size:  qW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(qWeightBuf, 0, qW);
+
+  const kWeightBuf = device.createBuffer({
+    label: "attn-k-weights",
+    size:  kW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(kWeightBuf, 0, kW);
+
+  const vWeightBuf = device.createBuffer({
+    label: "attn-v-weights",
+    size:  vW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vWeightBuf, 0, vW);
+
+  const oWeightBuf = device.createBuffer({
+    label: "attn-o-weights",
+    size:  oW.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(oWeightBuf, 0, oW);
+
+  // ── GPU-only intermediate buffers ──────────────────────
+  const qVecBuf = device.createBuffer({
+    label: "attn-q-vec",
+    size:  Q_DIM * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const kVecBuf = device.createBuffer({
+    label: "attn-k-vec",
+    size:  KV_DIM * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const vVecBuf = device.createBuffer({
+    label: "attn-v-vec",
+    size:  KV_DIM * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  const attnOutBuf = device.createBuffer({
+    label: "attn-out",
+    size:  Q_DIM * 4,
+    usage: GPUBufferUsage.STORAGE,
+  });
+
+  // ── Final result + staging ─────────────────────────────
+  const resultBuf = device.createBuffer({
+    label: "attn-o-result",
+    size:  HIDDEN_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const stagingBuf = device.createBuffer({
+    label: "attn-staging",
+    size:  HIDDEN_DIM * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // ── Uniform buffers ────────────────────────────────────
+  // Q proj: M=Q_DIM(2560), K=HIDDEN_DIM(2560), stride=160
+  const qUniform = device.createBuffer({
+    label: "attn-q-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(qUniform, 0, new Uint32Array([Q_DIM, HIDDEN_DIM, qStride, 0]));
+
+  // K/V proj: M=KV_DIM(640), K=HIDDEN_DIM(2560), stride=160
+  const kvUniform = device.createBuffer({
+    label: "attn-kv-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(kvUniform, 0, new Uint32Array([KV_DIM, HIDDEN_DIM, kStride, 0]));
+
+  // RoPE: seq_pos, q_dim, kv_dim, head_dim
+  const ropeUniform = device.createBuffer({
+    label: "attn-rope-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(ropeUniform, 0, new Uint32Array([seqPosition, Q_DIM, KV_DIM, HEAD_DIM]));
+
+  // GQA Attention: seq_len(pos+1), kv_dim, head_dim, num_q_heads
+  const gqaUniform = device.createBuffer({
+    label: "attn-gqa-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(gqaUniform, 0, new Uint32Array([seqPosition + 1, KV_DIM, HEAD_DIM, NUM_Q_HEADS]));
+
+  // O proj: M=HIDDEN_DIM(2560), K=Q_DIM(2560), stride=160
+  const oUniform = device.createBuffer({
+    label: "attn-o-params", size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(oUniform, 0, new Uint32Array([HIDDEN_DIM, Q_DIM, oStride, 0]));
+
+  // ── Compile pipelines ──────────────────────────────────
+  const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
+  const ropeModule = device.createShaderModule({ code: SHADER_ROPE_CACHE });
+  const gqaModule  = device.createShaderModule({ code: SHADER_GQA_ATTENTION });
+
+  const matBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const matPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [matBGL] }),
+    compute: { module: matModule, entryPoint: "main" },
+  });
+
+  const ropeBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const ropePipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [ropeBGL] }),
+    compute: { module: ropeModule, entryPoint: "main" },
+  });
+
+  const gqaBGL = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    ],
+  });
+  const gqaPipeline = device.createComputePipeline({
+    layout:  device.createPipelineLayout({ bindGroupLayouts: [gqaBGL] }),
+    compute: { module: gqaModule, entryPoint: "main" },
+  });
+
+  // ── Bind groups ────────────────────────────────────────
+  // Pass 1: q_vec = q_proj × input
+  const qBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: qWeightBuf } },
+      { binding: 2, resource: { buffer: qVecBuf } },
+      { binding: 3, resource: { buffer: qUniform } },
+    ],
+  });
+
+  // Pass 2: k_vec = k_proj × input
+  const kBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: kWeightBuf } },
+      { binding: 2, resource: { buffer: kVecBuf } },
+      { binding: 3, resource: { buffer: kvUniform } },
+    ],
+  });
+
+  // Pass 3: v_vec = v_proj × input
+  const vBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: inputBuf } },
+      { binding: 1, resource: { buffer: vWeightBuf } },
+      { binding: 2, resource: { buffer: vVecBuf } },
+      { binding: 3, resource: { buffer: kvUniform } },  // same dims as K
+    ],
+  });
+
+  // Pass 4: RoPE + Cache Write
+  const ropeBG = device.createBindGroup({
+    layout: ropeBGL,
+    entries: [
+      { binding: 0, resource: { buffer: qVecBuf } },
+      { binding: 1, resource: { buffer: kVecBuf } },
+      { binding: 2, resource: { buffer: vVecBuf } },
+      { binding: 3, resource: { buffer: kCacheBuf } },
+      { binding: 4, resource: { buffer: vCacheBuf } },
+      { binding: 5, resource: { buffer: ropeUniform } },
+    ],
+  });
+
+  // Pass 5: GQA Attention
+  const gqaBG = device.createBindGroup({
+    layout: gqaBGL,
+    entries: [
+      { binding: 0, resource: { buffer: qVecBuf } },
+      { binding: 1, resource: { buffer: kCacheBuf } },
+      { binding: 2, resource: { buffer: vCacheBuf } },
+      { binding: 3, resource: { buffer: attnOutBuf } },
+      { binding: 4, resource: { buffer: gqaUniform } },
+    ],
+  });
+
+  // Pass 6: result = o_proj × attn_out
+  const oBG = device.createBindGroup({
+    layout: matBGL,
+    entries: [
+      { binding: 0, resource: { buffer: attnOutBuf } },
+      { binding: 1, resource: { buffer: oWeightBuf } },
+      { binding: 2, resource: { buffer: resultBuf } },
+      { binding: 3, resource: { buffer: oUniform } },
+    ],
+  });
+
+  const setupMs = performance.now() - setupT0;
+
+  // ═══════════════════════════════════════════════════════
+  //  SINGLE command encoder – all 6 passes, zero CPU trips
+  // ═══════════════════════════════════════════════════════
+  const computeT0 = performance.now();
+  const encoder = device.createCommandEncoder();
+
+  // Pass 1: Q projection (2560 × 2560 → 2560)
+  const p1 = encoder.beginComputePass();
+  p1.setPipeline(matPipeline);
+  p1.setBindGroup(0, qBG);
+  p1.dispatchWorkgroups(Q_DIM);
+  p1.end();
+
+  // Pass 2: K projection (640 × 2560 → 640)
+  const p2 = encoder.beginComputePass();
+  p2.setPipeline(matPipeline);
+  p2.setBindGroup(0, kBG);
+  p2.dispatchWorkgroups(KV_DIM);
+  p2.end();
+
+  // Pass 3: V projection (640 × 2560 → 640)
+  const p3 = encoder.beginComputePass();
+  p3.setPipeline(matPipeline);
+  p3.setBindGroup(0, vBG);
+  p3.dispatchWorkgroups(KV_DIM);
+  p3.end();
+
+  // Pass 4: RoPE + KV Cache write
+  const p4 = encoder.beginComputePass();
+  p4.setPipeline(ropePipeline);
+  p4.setBindGroup(0, ropeBG);
+  p4.dispatchWorkgroups(Math.ceil(Q_DIM / 2 / WORKGROUP_SIZE));
+  p4.end();
+
+  // Pass 5: GQA Attention (20 heads)
+  const p5 = encoder.beginComputePass();
+  p5.setPipeline(gqaPipeline);
+  p5.setBindGroup(0, gqaBG);
+  p5.dispatchWorkgroups(NUM_Q_HEADS);
+  p5.end();
+
+  // Pass 6: O projection (2560 × 2560 → 2560)
+  const p6 = encoder.beginComputePass();
+  p6.setPipeline(matPipeline);
+  p6.setBindGroup(0, oBG);
+  p6.dispatchWorkgroups(HIDDEN_DIM);
+  p6.end();
+
+  // Copy final result to staging
+  encoder.copyBufferToBuffer(resultBuf, 0, stagingBuf, 0, HIDDEN_DIM * 4);
+  device.queue.submit([encoder.finish()]);
+
+  // Single async readback
+  await stagingBuf.mapAsync(GPUMapMode.READ);
+  const results = new Float32Array(stagingBuf.getMappedRange().slice(0));
+  stagingBuf.unmap();
+
+  const computeMs = performance.now() - computeT0;
+
+  // Cleanup (do NOT destroy kCacheBuf/vCacheBuf – they persist!)
+  [
+    inputBuf, qWeightBuf, kWeightBuf, vWeightBuf, oWeightBuf,
+    qVecBuf, kVecBuf, vVecBuf, attnOutBuf,
+    resultBuf, stagingBuf,
+    qUniform, kvUniform, ropeUniform, gqaUniform, oUniform,
+  ].forEach(b => b.destroy());
+
+  return { results, setupMs, computeMs, newSeqPos: seqPosition + 1 };
+}
+
+// ════════════════════════════════════════════════
 // 9. Validation
 // ════════════════════════════════════════════════
 
@@ -1509,6 +2057,19 @@ async function main() {
 
   const device = await initWebGPU();
   log("✔ WebGPU device acquired", "info");
+
+  // ── Allocate persistent KV cache buffers ──
+  kCacheBuf = device.createBuffer({
+    label: "kv-cache-k",
+    size:  MAX_SEQ_LEN * KV_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  vCacheBuf = device.createBuffer({
+    label: "kv-cache-v",
+    size:  MAX_SEQ_LEN * KV_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  log(`  KV Cache allocated: 2 × ${MAX_SEQ_LEN} × ${KV_DIM} × 4 = ${(2 * MAX_SEQ_LEN * KV_DIM * 4 / 1024).toFixed(0)} KB`, 'info');
   log("");
 
   // ─────────────────────────────────────────────
@@ -1801,6 +2362,60 @@ async function main() {
   log("");
 
   // ─────────────────────────────────────────────
+  // Load Self-Attention Weights (q_proj + k_proj + v_proj + o_proj)
+  // ─────────────────────────────────────────────
+
+  log(`━━━ Loading Self-Attention Weights (Layer 0) ━━━`);
+  log("");
+
+  try {
+    const attnFiles = [
+      { name: "q_proj", file: "bitnet_layer_0_q_proj.bin", M: Q_DIM,      K: HIDDEN_DIM },
+      { name: "k_proj", file: "bitnet_layer_0_k_proj.bin", M: KV_DIM,     K: HIDDEN_DIM },
+      { name: "v_proj", file: "bitnet_layer_0_v_proj.bin", M: KV_DIM,     K: HIDDEN_DIM },
+      { name: "o_proj", file: "bitnet_layer_0_o_proj.bin", M: HIDDEN_DIM, K: Q_DIM },
+    ];
+
+    const attnResponses = await Promise.all(attnFiles.map(f => fetch(f.file)));
+    for (let i = 0; i < attnFiles.length; i++) {
+      if (!attnResponses[i].ok) {
+        throw new Error(`${attnFiles[i].file}: HTTP ${attnResponses[i].status}`);
+      }
+    }
+
+    const attnBufs = await Promise.all(attnResponses.map(r => r.arrayBuffer()));
+    qProjWeights = new Uint32Array(attnBufs[0]);
+    kProjWeights = new Uint32Array(attnBufs[1]);
+    vProjWeights = new Uint32Array(attnBufs[2]);
+    oProjWeights = new Uint32Array(attnBufs[3]);
+
+    const allAttnWeights = [qProjWeights, kProjWeights, vProjWeights, oProjWeights];
+    for (let i = 0; i < attnFiles.length; i++) {
+      const w = allAttnWeights[i];
+      const { name, M: mRows, K: kCols } = attnFiles[i];
+      const stride = Math.ceil(kCols / 16);
+      const expected = mRows * stride;
+      log(`  ${name}: ${w.length.toLocaleString()} u32 (${(w.byteLength / 1024).toFixed(1)} KB)` +
+          ` — ${mRows}×${kCols}, stride ${stride}`, "info");
+      if (w.length !== expected) {
+        throw new Error(`${name} size mismatch: got ${w.length}, expected ${expected}`);
+      }
+    }
+
+    log("");
+    log("  ✅ All attention weights loaded – Self-Attention pipeline ready", "pass");
+    log(`  GQA config: ${NUM_Q_HEADS} Q heads, ${NUM_KV_HEADS} KV heads, group size ${GQA_GROUP_SIZE}`, "info");
+  } catch (err) {
+    log(`  ❌ FAIL – Could not load attention weights: ${err.message}`, "fail");
+    log(`     Run: python extract_attention.py  to generate the .bin files`, "info");
+    qProjWeights = null;
+    kProjWeights = null;
+    vProjWeights = null;
+    oProjWeights = null;
+  }
+  log("");
+
+  // ─────────────────────────────────────────────
   // Summary
   // ─────────────────────────────────────────────
 
@@ -1818,7 +2433,7 @@ async function main() {
   log("");
 
   if (gateWeights && upWeights && downWeights && lmHeadWeights) {
-    log("✔ Interactive mode ready (SwiGLU MLP + LM Head) – type text above and click Compute!", "pass");
+    log("✔ Interactive mode ready (Self-Attention + SwiGLU MLP + LM Head) – type text above and click Compute!", "pass");
     const inputEl = document.getElementById("user-text");
     const btnEl   = document.getElementById("compute-btn");
     if (inputEl) inputEl.disabled = false;
@@ -1877,24 +2492,50 @@ async function onComputeClick() {
     // 1. Tokenize → real embedding (2560 dims, no padding)
     const emb = getRealEmbedding(text);
 
-    // 2. Run full SwiGLU MLP (unified GPU, zero CPU round-trips)
+    // 2. Self-Attention block (Q/K/V projections → RoPE → GQA → O projection)
+    let postAttnResidual = emb;
+    let attnSetup = 0, attnCompute = 0;
+    if (qProjWeights && kProjWeights && vProjWeights && oProjWeights && kCacheBuf && vCacheBuf) {
+      const normedForAttn = simpleRMSNorm(emb);
+      seqPos = 0;  // reset KV cache for new sequence
+
+      const attnResult = await runSelfAttention(
+        gpuDevice, qProjWeights, kProjWeights, vProjWeights, oProjWeights,
+        normedForAttn, seqPos,
+      );
+      attnSetup   = attnResult.setupMs;
+      attnCompute = attnResult.computeMs;
+      seqPos      = attnResult.newSeqPos;
+
+      // Residual connection: original embedding + attention output
+      postAttnResidual = new Float32Array(HIDDEN_DIM);
+      for (let i = 0; i < HIDDEN_DIM; i++) {
+        postAttnResidual[i] = emb[i] + attnResult.results[i];
+      }
+    }
+
+    // 3. Pre-MLP RMSNorm
+    const normedForMLP = simpleRMSNorm(postAttnResidual);
+
+    // 4. Run full SwiGLU MLP (unified GPU, zero CPU round-trips)
     const { results: mlpOut, setupMs: mlpSetup, computeMs: mlpCompute } = await runFullMLP(
       gpuDevice, gateWeights, upWeights, downWeights,
-      emb, HIDDEN_DIM, MLP_DIM,
+      normedForMLP, HIDDEN_DIM, MLP_DIM,
     );
 
-    // 2b. RMSNorm – squish MLP output into a safe range before LM Head.
-    //     Without this the ~140K-scale values overflow FP32 dot products.
-    const mlpMax = mlpOut.reduce((a, b) => Math.max(a, Math.abs(b)), 0);
-    const normedMlp = simpleRMSNorm(mlpOut);
-    const normMax = normedMlp.reduce((a, b) => Math.max(a, Math.abs(b)), 0);
+    // 4b. Post-MLP residual + Pre-LM-Head RMSNorm
+    const postMLPResidual = new Float32Array(HIDDEN_DIM);
+    for (let i = 0; i < HIDDEN_DIM; i++) {
+      postMLPResidual[i] = postAttnResidual[i] + mlpOut[i];
+    }
+    const normedFinal = simpleRMSNorm(postMLPResidual);
 
-    // 3. Run LM Head (dense mat-vec: 16385 × 2560)
+    // 5. Run LM Head (dense mat-vec: 16385 × 2560)
     const { results: logits, setupMs: lmSetup, computeMs: lmCompute } = await runLMHeadKernel(
-      gpuDevice, lmHeadWeights, normedMlp, LM_HEAD_ROWS, HIDDEN_DIM,
+      gpuDevice, lmHeadWeights, normedFinal, LM_HEAD_ROWS, HIDDEN_DIM,
     );
 
-    // 4. Argmax → winning sparse index
+    // 6. Argmax → winning sparse index
     const sparseIdx = argmax(logits);
     const topLogit  = logits[sparseIdx];
 
@@ -1925,16 +2566,17 @@ async function onComputeClick() {
     ilog(`═══════════════════════════════════════════`, "info");
     ilog("");
 
-    const totalSetup   = mlpSetup + lmSetup;
-    const totalCompute = mlpCompute + lmCompute;
+    const totalSetup   = attnSetup + mlpSetup + lmSetup;
+    const totalCompute = attnCompute + mlpCompute + lmCompute;
     ilog(`Pipeline Timing:`, "info");
+    if (attnSetup || attnCompute) {
+      ilog(`  Attn Setup  : ${attnSetup.toFixed(3)} ms   |  Attn Compute : ${attnCompute.toFixed(3)} ms`, "info");
+    }
     ilog(`  MLP Setup   : ${mlpSetup.toFixed(3)} ms   |  MLP Compute  : ${mlpCompute.toFixed(3)} ms`, "info");
     ilog(`  LM Head Setup: ${lmSetup.toFixed(3)} ms   |  LM Head Compute: ${lmCompute.toFixed(3)} ms`, "info");
     ilog(`  ─────────────────────────────────────`);
     ilog(`  Total Setup  : ${totalSetup.toFixed(3)} ms   |  Total Compute: ${totalCompute.toFixed(3)} ms`, "info");
     ilog(`  Grand Total  : ${(totalSetup + totalCompute).toFixed(3)} ms`, "info");
-    ilog("");
-    ilog(`RMSNorm: max |MLP raw| = ${mlpMax.toFixed(2)} → max |normed| = ${normMax.toFixed(6)}`, "info");
     ilog("");
 
     // Top-5 logits for insight
