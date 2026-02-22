@@ -16,6 +16,12 @@
  *   4. Automated Validation – CPU reference runs the same ternary
  *      math; results are strictly compared with ✅ PASS / ❌ FAIL.
  *
+ *   5. W1.58A8 Activation Quantization – dynamic INT8 quantization
+ *      of activation vectors on the fly in the shader.  Ternary
+ *      weights stay packed at 1.58-bit; activations are quantized
+ *      to i8 in workgroup shared memory, dot products use pure
+ *      integer arithmetic, and results are dequantized to f32.
+ *
  * Weight encoding (2 bits per weight):
  *   0b00  →  0   (skip)
  *   0b01  → +1   (add input)
@@ -394,6 +400,159 @@ fn main(
   }
 }
 `;
+
+// ════════════════════════════════════════════════
+// 2b. WGSL – W1.58A8 Tiled Mat-Vec (Activation Quantization)
+//     [PARKED] Reverted to FP32 – kept as reference for when
+//     WebGPU gains packed_4x8_integer_dot_product (DP4a).
+// ════════════════════════════════════════════════
+/*
+// Architecture: W1.58A8
+// ─────────────────────
+//   Weights stay 1.58-bit packed (2 bits per u32, 16 per word).
+//   Activations (input_vec) are dynamically quantized to INT8
+//   on the fly inside the shader, enabling pure integer dot products.
+//
+// Pipeline per workgroup (one row of output):
+//   Phase 0 – Quantize activations:
+//     • Cooperatively scan input_vec to find abs_max
+//     • scale = 127.0 / abs_max
+//     • inv_scale = abs_max / 127.0
+//   Phase 1 – Tiled integer mat-vec:
+//     • Load tile of input_vec → quantize to i32 in shared memory
+//     • Unpack 2-bit ternary weights
+//     • Integer multiply-accumulate: acc += weight_ternary * act_int
+//   Phase 2 – Reduce & dequantize:
+//     • Binary tree reduction of i32 partial sums
+//     • output = f32(int_sum) * inv_scale
+
+const SHADER_2D_TILED_A8 = ` // wgsl
+
+const TILE_K_C: u32         = ${TILE_K}u;
+const WG_SIZE_C: u32        = ${WORKGROUP_SIZE}u;
+const ELEMS_PER_THREAD: u32 = ${ELEMS_PER_THREAD}u;
+
+struct MatParams {
+  M: u32,              // rows   (output length)
+  K: u32,              // cols   (input  length)
+  packed_stride: u32,  // u32s per packed row = ceil(K / 16)
+}
+
+@group(0) @binding(0) var<storage, read>       input_vec:      array<f32>;
+@group(0) @binding(1) var<storage, read>       packed_weights: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output_vec:     array<f32>;
+@group(0) @binding(3) var<uniform>             params:         MatParams;
+
+// ── Workgroup shared memory ──
+// tile_q[]      – quantised INT8 activations (stored as i32)
+// shared_max[]  – per-thread local maximums for abs_max reduction
+// shared_iacc[] – per-thread integer partial sums for final reduction
+var<workgroup> tile_q:      array<i32, ${TILE_K}>;
+var<workgroup> shared_max:  array<f32, ${WORKGROUP_SIZE}>;
+var<workgroup> shared_iacc: array<i32, ${WORKGROUP_SIZE}>;
+
+@compute @workgroup_size(${WORKGROUP_SIZE})
+fn main(
+  @builtin(workgroup_id)        wid: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+) {
+  let row = wid.x;
+  let tid = lid.x;
+
+  if (row >= params.M) { return; }
+
+  // ═══════════════════════════════════════════════════════
+  // Phase 0: Dynamic Activation Quantization
+  //   Cooperatively find abs_max of the entire input_vec,
+  //   then compute scale factors for INT8 quantization.
+  // ═══════════════════════════════════════════════════════
+  var local_max: f32 = 0.0;
+  for (var i: u32 = tid; i < params.K; i = i + WG_SIZE_C) {
+    local_max = max(local_max, abs(input_vec[i]));
+  }
+  shared_max[tid] = local_max;
+  workgroupBarrier();
+
+  // Binary reduction → shared_max[0] = global abs_max
+  for (var s: u32 = WG_SIZE_C / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+    }
+    workgroupBarrier();
+  }
+
+  let abs_max   = shared_max[0];
+  let scale     = select(1.0, 127.0 / abs_max, abs_max > 0.0);
+  let inv_scale = select(0.0, abs_max / 127.0, abs_max > 0.0);
+
+  // ═══════════════════════════════════════════════════════
+  // Phase 1 & 2: Tiled Integer Mat-Vec
+  //   Activations are quantised to i32 (INT8 range) in
+  //   shared memory.  Ternary weights are unpacked from
+  //   packed u32s.  Dot product uses pure integer math.
+  // ═══════════════════════════════════════════════════════
+  var int_acc: i32 = 0;
+  let num_tiles = (params.K + TILE_K_C - 1u) / TILE_K_C;
+
+  for (var t: u32 = 0u; t < num_tiles; t = t + 1u) {
+
+    // ── Tile load: quantise f32 activations → i32 ──────
+    for (var e: u32 = 0u; e < ELEMS_PER_THREAD; e = e + 1u) {
+      let local_idx  = tid * ELEMS_PER_THREAD + e;
+      let global_col = t * TILE_K_C + local_idx;
+      if (global_col < params.K) {
+        tile_q[local_idx] = i32(round(input_vec[global_col] * scale));
+      } else {
+        tile_q[local_idx] = 0i;
+      }
+    }
+    workgroupBarrier();
+
+    // ── Integer dot product with ternary weights ───────
+    for (var e: u32 = 0u; e < ELEMS_PER_THREAD; e = e + 1u) {
+      let local_idx  = tid * ELEMS_PER_THREAD + e;
+      let global_col = t * TILE_K_C + local_idx;
+
+      if (global_col < params.K) {
+        // Unpack 2-bit ternary weight for (row, global_col)
+        let pack_idx = row * params.packed_stride + global_col / 16u;
+        let bit_pos  = (global_col % 16u) * 2u;
+        let code     = (packed_weights[pack_idx] >> bit_pos) & 3u;
+
+        // Ternary integer multiply (branchless):
+        //   code 0b01 → bit0=1, bit1=0 → +1 * act
+        //   code 0b10 → bit0=0, bit1=1 → -1 * act
+        //   code 0b00 → bit0=0, bit1=0 →  0 * act
+        let bit0 = i32(code & 1u);
+        let bit1 = i32((code >> 1u) & 1u);
+        int_acc = int_acc + tile_q[local_idx] * (bit0 - bit1);
+      }
+    }
+    workgroupBarrier();
+  }
+
+  // ═══════════════════════════════════════════════════════
+  // Phase 3: Integer Reduction + Dequantization
+  //   Sum partial i32 accumulators across all threads,
+  //   then convert back to f32 and multiply by inv_scale.
+  // ═══════════════════════════════════════════════════════
+  shared_iacc[tid] = int_acc;
+  workgroupBarrier();
+
+  for (var s: u32 = WG_SIZE_C / 2u; s > 0u; s = s >> 1u) {
+    if (tid < s) {
+      shared_iacc[tid] = shared_iacc[tid] + shared_iacc[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  // Thread 0 dequantises and writes the final output.
+  if (tid == 0u) {
+    output_vec[row] = f32(shared_iacc[0]) * inv_scale;
+  }
+}
+`;
+*/  // END of parked SHADER_2D_TILED_A8
 
 // ════════════════════════════════════════════════
 // 3. JS – Pack Ternary Weights
@@ -1431,6 +1590,110 @@ function argmax(arr) {
 }
 
 /**
+ * Sample a token from logits using Repetition Penalty + Temperature +
+ * Top-K + Top-P (nucleus) sampling.
+ *
+ * Pipeline:
+ *   0. Apply repetition penalty to previously generated tokens
+ *   1. Apply temperature scaling:  logits[i] /= temperature
+ *   2. Softmax → probabilities
+ *   3. Sort descending by probability
+ *   4. Top-K: keep only the K highest-probability tokens
+ *   5. Top-P: keep tokens until cumulative probability >= P
+ *   6. Renormalize the surviving probabilities
+ *   7. Weighted random sample from the remaining distribution
+ *
+ * @param {Float32Array} logits           – raw logits from LM head
+ * @param {number}       temperature      – sharpness control (default 1.0)
+ * @param {number}       topK             – max tokens to consider (default 50)
+ * @param {number}       topP             – cumulative probability cutoff (default 0.9)
+ * @param {Set|Array}    generatedTokens  – sparse indices already emitted (for penalty)
+ * @param {number}       repetitionPenalty – divisor for repeated positive logits (default 1.2)
+ * @returns {number} selected index into logits array
+ */
+function sampleToken(logits, temperature = 1.0, topK = 50, topP = 0.9,
+                     generatedTokens = null, repetitionPenalty = 1.2) {
+  const n = logits.length;
+
+  // ── 0. Frequency-scaled repetition penalty ──────────────
+  //   Each token is penalised proportionally to how many times
+  //   it has already been emitted:  penalty_factor = penalty^count.
+  //   Positive logits are divided, negative logits are multiplied,
+  //   so repeated tokens become exponentially less likely.
+  const penalised = new Float32Array(logits);
+  if (generatedTokens && generatedTokens.size > 0) {
+    for (const [idx, count] of generatedTokens) {
+      if (idx < n) {
+        const factor = Math.pow(repetitionPenalty, count);
+        if (penalised[idx] > 0) {
+          penalised[idx] /= factor;
+        } else {
+          penalised[idx] *= factor;
+        }
+      }
+    }
+  }
+
+  // ── 1. Temperature scaling ──────────────────────────────
+  const scaled = new Float32Array(n);
+  const invTemp = 1.0 / Math.max(temperature, 1e-8);
+  for (let i = 0; i < n; i++) {
+    scaled[i] = penalised[i] * invTemp;
+  }
+
+  // ── 2. Stable softmax ───────────────────────────────────
+  let maxLogit = -Infinity;
+  for (let i = 0; i < n; i++) {
+    if (scaled[i] > maxLogit) maxLogit = scaled[i];
+  }
+
+  let sumExp = 0;
+  const probs = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    probs[i] = Math.exp(scaled[i] - maxLogit);
+    sumExp += probs[i];
+  }
+  for (let i = 0; i < n; i++) {
+    probs[i] /= sumExp;
+  }
+
+  // ── 3. Build index array and sort descending by prob ────
+  const indices = new Array(n);
+  for (let i = 0; i < n; i++) indices[i] = i;
+  indices.sort((a, b) => probs[b] - probs[a]);
+
+  // ── 4. Top-K: keep only the top K entries ───────────────
+  const kCut = Math.min(topK, n);
+
+  // ── 5. Top-P: keep tokens until cumulative prob >= P ────
+  let cumProb = 0;
+  let pCut = kCut;  // defaults to full top-K if topP >= 1.0
+  for (let i = 0; i < kCut; i++) {
+    cumProb += probs[indices[i]];
+    if (cumProb >= topP) {
+      pCut = i + 1;
+      break;
+    }
+  }
+
+  // ── 6. Renormalize surviving probabilities ──────────────
+  let renormSum = 0;
+  for (let i = 0; i < pCut; i++) {
+    renormSum += probs[indices[i]];
+  }
+
+  // ── 7. Weighted random sample ───────────────────────────
+  let r = Math.random() * renormSum;
+  for (let i = 0; i < pCut; i++) {
+    r -= probs[indices[i]];
+    if (r <= 0) return indices[i];
+  }
+
+  // Fallback (floating-point edge case)
+  return indices[0];
+}
+
+/**
  * CPU-side RMSNorm – squishes values into a safe range so the
  * LM Head dot products don't overflow FP32.
  *
@@ -1572,7 +1835,7 @@ async function runFullMLP(device, gateW, upW, downW, inputVec, hiddenDim, mlpDim
     new Uint32Array([hiddenDim, mlpDim, downStride, 0]),
   );
 
-  // ── Compile pipelines ──────────────────────────────────
+  // ── Compile pipelines (FP32 tiled mat-vec) ──
   const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
   const siluModule = device.createShaderModule({ code: SHADER_SILU_MUL });
 
@@ -1842,7 +2105,7 @@ async function runSelfAttention(device, qW, kW, vW, oW, inputVec, seqPosition) {
   });
   device.queue.writeBuffer(oUniform, 0, new Uint32Array([HIDDEN_DIM, Q_DIM, oStride, 0]));
 
-  // ── Compile pipelines ──────────────────────────────────
+  // ── Compile pipelines (FP32 tiled mat-vec projections) ──
   const matModule  = device.createShaderModule({ code: SHADER_2D_TILED });
   const ropeModule = device.createShaderModule({ code: SHADER_ROPE_CACHE });
   const gqaModule  = device.createShaderModule({ code: SHADER_GQA_ATTENTION });
@@ -2610,9 +2873,14 @@ async function generateText(prompt, maxTokens = 20, onToken = null) {
   }
 
   // ── Phase 2: Decode ──
-  // Argmax the prefill logits → first generated token, then loop.
+  // Sample with Repetition Penalty + Temperature + Top-K + Top-P.
+  // Track generated sparse indices so the penalty can tax repeat tokens.
+  const generatedHistory = new Map();   // sparseIdx → count
+
   while (generatedCount < maxTokens) {
-    const sparseIdx = argmax(lastLogits);
+    const sparseIdx = sampleToken(lastLogits, 1.0, 50, 0.9, generatedHistory, 1.5);
+    generatedHistory.set(sparseIdx, (generatedHistory.get(sparseIdx) || 0) + 1);
+
     const origId = reverseVocabMap
       ? parseInt(reverseVocabMap[String(sparseIdx)] ?? '-1', 10)
       : -1;
