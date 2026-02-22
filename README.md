@@ -168,21 +168,21 @@ files that the browser can `fetch()` directly into GPU buffers.
 
 WebGPU requires a **secure context** (`https://`). Browsers make a special exception for `localhost`, but if you try to access your MacBook via its local IP address (e.g. `http://192.168.1.X:8080`), mobile Safari/Chrome will block WebGPU.
 
-The fastest solution is **ngrok**, which creates a temporary `https://` tunnel from the internet to your local server.
+The fastest solution is **Cloudflare Tunnels**, which creates a temporary `https://` tunnel from the internet to your local server.
 
 1. **Keep your local server running** in one terminal:
    ```bash
    npx serve . -l 8080
    ```
 
-2. **Open a second terminal** and start ngrok:
+2. **Open a second terminal** and start cloudflared:
    ```bash
-   npx ngrok http 8080
+   npx cloudflared tunnel --url http://localhost:8080
    ```
 
-3. **Copy the secure URL** from the ngrok output. Look for the **Forwarding** line:
+3. **Copy the secure URL** from the cloudflared output. Look for the line containing `trycloudflare.com`:
    ```
-   Forwarding    https://a1b2-c3d4.ngrok-free.app -> http://localhost:8080
+   https://your-random-subdomain.trycloudflare.com
    ```
 
 4. **Open that `https://` URL** on your iPhone or iPad.
@@ -190,7 +190,7 @@ The fastest solution is **ngrok**, which creates a temporary `https://` tunnel f
    - The `.bin` weight files are served directly from your MacBook over your local network — nothing is uploaded to the internet.
    - First load will take a few seconds as the ~175 MB of weight files transfer over Wi-Fi.
 
-> **Note:** You can install ngrok globally (`npm i -g ngrok`) or use `npx` for zero-install one-off usage. A free ngrok account is sufficient — the only limitation is a random subdomain that changes each session.
+> **Note:** You can use `npx` for zero-install one-off usage. A free Cloudflare tunnel is sufficient — the only limitation is a random subdomain that changes each session.
 
 ## Extracting Real AI Weights (Optional)
 

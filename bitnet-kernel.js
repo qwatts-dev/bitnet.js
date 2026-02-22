@@ -570,6 +570,35 @@ function getRealEmbedding(text) {
 }
 
 // ════════════════════════════════════════════════
+// 5b′. Embedding Lookup by Raw Token ID
+// ════════════════════════════════════════════════
+
+/**
+ * Look up the embedding for a raw token ID (no tokenization step).
+ * Used by the autoregressive loop where we already know the token ID.
+ *
+ * @param {number} tokenId – original Llama 3 token ID
+ * @returns {Float32Array} embedding of length EMBED_DIM (2560)
+ */
+function getEmbeddingByTokenId(tokenId) {
+  if (!embeddingData || !vocabMap) {
+    throw new Error('Embeddings not loaded – call loadEmbeddings() first.');
+  }
+
+  let rowIndex = vocabMap[String(tokenId)];
+  if (rowIndex === undefined) {
+    rowIndex = 0;   // OOV fallback
+  }
+
+  const fp16Start = rowIndex * EMBED_DIM;
+  const embedding = new Float32Array(EMBED_DIM);
+  for (let i = 0; i < EMBED_DIM; i++) {
+    embedding[i] = fp16ToNumber(embeddingData[fp16Start + i]);
+  }
+  return embedding;
+}
+
+// ════════════════════════════════════════════════
 // 5c-LM. WGSL – Dense LM Head Mat-Vec (Float32, NOT ternary)
 // ════════════════════════════════════════════════
 //
@@ -2433,7 +2462,7 @@ async function main() {
   log("");
 
   if (gateWeights && upWeights && downWeights && lmHeadWeights) {
-    log("✔ Interactive mode ready (Self-Attention + SwiGLU MLP + LM Head) – type text above and click Compute!", "pass");
+    log("✔ Interactive mode ready (Auto-Regressive Generation) – type a prompt and click Generate!", "pass");
     const inputEl = document.getElementById("user-text");
     const btnEl   = document.getElementById("compute-btn");
     if (inputEl) inputEl.disabled = false;
@@ -2453,18 +2482,182 @@ async function main() {
 }
 
 // ════════════════════════════════════════════════
-// 12. Interactive Compute Handler
+// 12. Auto-Regressive Generation
+// ════════════════════════════════════════════════
+
+// EOS token IDs for Llama 3
+const EOS_TOKENS = new Set([128001, 128009]);
+
+/**
+ * Run one full transformer forward pass for a single token.
+ *
+ * Pipeline:  Embedding → RMSNorm → Self-Attention → Residual
+ *          → RMSNorm → SwiGLU MLP → Residual → RMSNorm → LM Head
+ *
+ * Advances the global `seqPos` by 1 and updates the KV cache.
+ *
+ * @param {number} tokenId – original Llama 3 token ID
+ * @returns {Promise<{logits: Float32Array, totalMs: number}>}
+ */
+async function forward(tokenId) {
+  const t0 = performance.now();
+
+  // 1. Embedding lookup
+  const emb = getEmbeddingByTokenId(tokenId);
+
+  // 2. Pre-attention RMSNorm + Self-Attention
+  let postAttnResidual = emb;
+
+  if (qProjWeights && kProjWeights && vProjWeights && oProjWeights && kCacheBuf && vCacheBuf) {
+    const normedForAttn = simpleRMSNorm(emb);
+
+    // 3. Self-Attention (Q/K/V proj → RoPE → KV cache → GQA → O proj)
+    const attnResult = await runSelfAttention(
+      gpuDevice, qProjWeights, kProjWeights, vProjWeights, oProjWeights,
+      normedForAttn, seqPos,
+    );
+    seqPos = attnResult.newSeqPos;
+
+    // 4. Post-attention residual connection
+    postAttnResidual = new Float32Array(HIDDEN_DIM);
+    for (let i = 0; i < HIDDEN_DIM; i++) {
+      postAttnResidual[i] = emb[i] + attnResult.results[i];
+    }
+  }
+
+  // 5. Pre-MLP RMSNorm
+  const normedForMLP = simpleRMSNorm(postAttnResidual);
+
+  // 6. SwiGLU MLP (gate → up → SiLU·mul → down)
+  const { results: mlpOut } = await runFullMLP(
+    gpuDevice, gateWeights, upWeights, downWeights,
+    normedForMLP, HIDDEN_DIM, MLP_DIM,
+  );
+
+  // 7. Post-MLP residual connection
+  const postMLPResidual = new Float32Array(HIDDEN_DIM);
+  for (let i = 0; i < HIDDEN_DIM; i++) {
+    postMLPResidual[i] = postAttnResidual[i] + mlpOut[i];
+  }
+
+  // 8. Pre-LM-Head RMSNorm
+  const normedFinal = simpleRMSNorm(postMLPResidual);
+
+  // 9. LM Head → logits
+  const { results: logits } = await runLMHeadKernel(
+    gpuDevice, lmHeadWeights, normedFinal, LM_HEAD_ROWS, HIDDEN_DIM,
+  );
+
+  const totalMs = performance.now() - t0;
+  return { logits, totalMs };
+}
+
+/**
+ * Decode a sparse logits index back to a printable string.
+ *
+ * @param {number} sparseIdx – index into the logits array (dense row)
+ * @returns {string} decoded token text
+ */
+function decodeToken(sparseIdx) {
+  if (!reverseVocabMap || reverseVocabMap[String(sparseIdx)] === undefined) {
+    return `<unmapped:${sparseIdx}>`;
+  }
+  const origId = parseInt(reverseVocabMap[String(sparseIdx)], 10);
+  if (!tokenizer) return `<no-tokenizer:${origId}>`;
+  try {
+    return tokenizer.decode([origId], true);
+  } catch {
+    return `<decode-error:${origId}>`;
+  }
+}
+
+/**
+ * Auto-regressive text generation with prefill + decode.
+ *
+ * Phase 1 – Prefill: feed every prompt token through forward() to
+ *   warm the KV cache.  No text is emitted.
+ *
+ * Phase 2 – Decode:  argmax the last prefill logits → first new token.
+ *   Then loop: emit token → check EOS → forward(newToken) → argmax.
+ *
+ * @param {string}   prompt    – user input text
+ * @param {number}   maxTokens – max NEW tokens to generate (default 20)
+ * @param {function} onToken   – callback(tokenStr, stats) for streaming UI
+ * @returns {Promise<{text: string, tokens: number, totalMs: number}>}
+ */
+async function generateText(prompt, maxTokens = 20, onToken = null) {
+  if (!tokenizer) throw new Error('Tokenizer not initialised.');
+
+  // Reset KV cache for new sequence
+  seqPos = 0;
+
+  // Tokenize the prompt
+  const encoded = tokenizer.encode(prompt);
+  const promptIds = Array.from(encoded.ids);
+  if (promptIds.length === 0) throw new Error('Empty prompt after tokenization.');
+
+  const t0 = performance.now();
+  let generatedText = '';
+  let generatedCount = 0;
+  let lastLogits = null;
+
+  // ── Phase 1: Prefill ──
+  // Feed each prompt token through the model to build the KV cache.
+  // We only need the logits from the LAST prompt token.
+  for (let i = 0; i < promptIds.length; i++) {
+    const { logits } = await forward(promptIds[i]);
+    lastLogits = logits;
+  }
+
+  // ── Phase 2: Decode ──
+  // Argmax the prefill logits → first generated token, then loop.
+  while (generatedCount < maxTokens) {
+    const sparseIdx = argmax(lastLogits);
+    const origId = reverseVocabMap
+      ? parseInt(reverseVocabMap[String(sparseIdx)] ?? '-1', 10)
+      : -1;
+
+    // Check EOS
+    if (EOS_TOKENS.has(origId)) break;
+
+    // Decode and accumulate
+    const tokenStr = decodeToken(sparseIdx);
+    generatedText += tokenStr;
+    generatedCount++;
+
+    // Stream callback
+    if (onToken) {
+      onToken(tokenStr, {
+        tokenNum: generatedCount,
+        tokenId: origId,
+        sparseIdx,
+        logit: lastLogits[sparseIdx],
+      });
+    }
+
+    // Guard against exceeding KV cache
+    if (seqPos >= MAX_SEQ_LEN - 1) break;
+
+    // Forward pass for the newly generated token
+    const result = await forward(origId);
+    lastLogits = result.logits;
+  }
+
+  const totalMs = performance.now() - t0;
+  return { text: generatedText, tokens: generatedCount, totalMs };
+}
+
+// ════════════════════════════════════════════════
+// 13. Interactive Compute Handler
 // ════════════════════════════════════════════════
 
 /**
- * Called when the user clicks "Compute" (or presses Enter).
+ * Called when the user clicks "Generate" (or presses Enter).
  *
- * Full pipeline: Embedding → SwiGLU MLP → LM Head → Argmax → Decode
- *   1. Tokenize input → look up real embedding (2560 dims)
- *   2. Run SwiGLU MLP on GPU (gate_proj, up_proj, SiLU·mul, down_proj)
- *   3. Run dense LM Head mat-vec on GPU → logits array
- *   4. Argmax → winning sparse index → reverse vocab map → token ID
- *   5. Decode token ID with the Llama 3 tokenizer → English word
+ * Auto-regressive generation with streaming UI updates.
+ *   1. Tokenize prompt → prefill KV cache
+ *   2. Decode loop: argmax → emit token → forward → repeat
+ *   3. Stop on EOS or maxTokens
  */
 async function onComputeClick() {
   const inputEl  = document.getElementById("user-text");
@@ -2475,131 +2668,54 @@ async function onComputeClick() {
   const text = inputEl.value.trim();
   if (!text) return;
 
-  // Disable controls while running
-  btnEl.disabled    = true;
-  inputEl.disabled  = true;
+  // Disable controls while generating
+  btnEl.disabled   = true;
+  inputEl.disabled = true;
   outEl.style.display = "block";
-  outEl.textContent   = "Computing…\n";
+
+  // Clear and set up output with prompt echo
+  outEl.textContent = "";
+
+  const promptSpan = document.createElement("span");
+  promptSpan.className = "info";
+  promptSpan.textContent = text;
+  outEl.appendChild(promptSpan);
+
+  // Streaming text node for generated tokens
+  const genSpan = document.createElement("span");
+  genSpan.className = "pass bold";
+  outEl.appendChild(genSpan);
+
+  const statsEl = document.createElement("div");
+  statsEl.style.marginTop = "0.75rem";
+  outEl.appendChild(statsEl);
 
   const ilog = (msg, cls) => {
     const span = document.createElement("span");
     if (cls) span.className = cls;
     span.textContent = msg + "\n";
-    outEl.appendChild(span);
+    statsEl.appendChild(span);
   };
 
   try {
-    // 1. Tokenize → real embedding (2560 dims, no padding)
-    const emb = getRealEmbedding(text);
+    const maxTokens = 20;
+    let tokenCount = 0;
 
-    // 2. Self-Attention block (Q/K/V projections → RoPE → GQA → O projection)
-    let postAttnResidual = emb;
-    let attnSetup = 0, attnCompute = 0;
-    if (qProjWeights && kProjWeights && vProjWeights && oProjWeights && kCacheBuf && vCacheBuf) {
-      const normedForAttn = simpleRMSNorm(emb);
-      seqPos = 0;  // reset KV cache for new sequence
+    const result = await generateText(text, maxTokens, (tokenStr, stats) => {
+      // Stream each token into the UI as it's generated
+      genSpan.textContent += tokenStr;
+      tokenCount = stats.tokenNum;
+    });
 
-      const attnResult = await runSelfAttention(
-        gpuDevice, qProjWeights, kProjWeights, vProjWeights, oProjWeights,
-        normedForAttn, seqPos,
-      );
-      attnSetup   = attnResult.setupMs;
-      attnCompute = attnResult.computeMs;
-      seqPos      = attnResult.newSeqPos;
-
-      // Residual connection: original embedding + attention output
-      postAttnResidual = new Float32Array(HIDDEN_DIM);
-      for (let i = 0; i < HIDDEN_DIM; i++) {
-        postAttnResidual[i] = emb[i] + attnResult.results[i];
-      }
-    }
-
-    // 3. Pre-MLP RMSNorm
-    const normedForMLP = simpleRMSNorm(postAttnResidual);
-
-    // 4. Run full SwiGLU MLP (unified GPU, zero CPU round-trips)
-    const { results: mlpOut, setupMs: mlpSetup, computeMs: mlpCompute } = await runFullMLP(
-      gpuDevice, gateWeights, upWeights, downWeights,
-      normedForMLP, HIDDEN_DIM, MLP_DIM,
-    );
-
-    // 4b. Post-MLP residual + Pre-LM-Head RMSNorm
-    const postMLPResidual = new Float32Array(HIDDEN_DIM);
-    for (let i = 0; i < HIDDEN_DIM; i++) {
-      postMLPResidual[i] = postAttnResidual[i] + mlpOut[i];
-    }
-    const normedFinal = simpleRMSNorm(postMLPResidual);
-
-    // 5. Run LM Head (dense mat-vec: 16385 × 2560)
-    const { results: logits, setupMs: lmSetup, computeMs: lmCompute } = await runLMHeadKernel(
-      gpuDevice, lmHeadWeights, normedFinal, LM_HEAD_ROWS, HIDDEN_DIM,
-    );
-
-    // 6. Argmax → winning sparse index
-    const sparseIdx = argmax(logits);
-    const topLogit  = logits[sparseIdx];
-
-    // 5. Reverse vocab map → original token ID → decode
-    let origTokenId = null;
-    let decodedWord = '???';
-    if (reverseVocabMap && reverseVocabMap[String(sparseIdx)] !== undefined) {
-      origTokenId = parseInt(reverseVocabMap[String(sparseIdx)], 10);
-      if (tokenizer) {
-        try {
-          decodedWord = tokenizer.decode([origTokenId], true);
-        } catch {
-          decodedWord = `<decode-error: ID ${origTokenId}>`;
-        }
-      }
-    } else {
-      decodedWord = `<unmapped sparse index ${sparseIdx}>`;
-    }
-
-    // 6. Display results
-    outEl.textContent = "";
-    ilog(`Input : "${text}"`);
+    // Final stats
     ilog("");
-
     ilog(`═══════════════════════════════════════════`, "info");
-    ilog(`  PREDICTED WORD:  "${decodedWord}"`, "pass bold");
-    ilog(`  Token ID: ${origTokenId}  |  Sparse Index: ${sparseIdx}  |  Logit: ${topLogit.toFixed(4)}`, "info");
+    ilog(`  Generated ${result.tokens} token(s) in ${result.totalMs.toFixed(1)} ms`, "info");
+    if (result.tokens > 0) {
+      ilog(`  Avg: ${(result.totalMs / (result.tokens + tokenizer.encode(text).ids.length)).toFixed(1)} ms/token (incl. prefill)`, "info");
+    }
     ilog(`═══════════════════════════════════════════`, "info");
-    ilog("");
 
-    const totalSetup   = attnSetup + mlpSetup + lmSetup;
-    const totalCompute = attnCompute + mlpCompute + lmCompute;
-    ilog(`Pipeline Timing:`, "info");
-    if (attnSetup || attnCompute) {
-      ilog(`  Attn Setup  : ${attnSetup.toFixed(3)} ms   |  Attn Compute : ${attnCompute.toFixed(3)} ms`, "info");
-    }
-    ilog(`  MLP Setup   : ${mlpSetup.toFixed(3)} ms   |  MLP Compute  : ${mlpCompute.toFixed(3)} ms`, "info");
-    ilog(`  LM Head Setup: ${lmSetup.toFixed(3)} ms   |  LM Head Compute: ${lmCompute.toFixed(3)} ms`, "info");
-    ilog(`  ─────────────────────────────────────`);
-    ilog(`  Total Setup  : ${totalSetup.toFixed(3)} ms   |  Total Compute: ${totalCompute.toFixed(3)} ms`, "info");
-    ilog(`  Grand Total  : ${(totalSetup + totalCompute).toFixed(3)} ms`, "info");
-    ilog("");
-
-    // Top-5 logits for insight
-    const indices = Array.from({length: logits.length}, (_, i) => i);
-    indices.sort((a, b) => logits[b] - logits[a]);
-    ilog("Top 5 Predictions:", "info");
-    ilog("┌──────┬────────────┬──────────────┬──────────────────┐");
-    ilog("│ Rank │ Sparse Idx │   Token ID   │      Word        │");
-    ilog("├──────┼────────────┼──────────────┼──────────────────┤");
-    for (let r = 0; r < 5; r++) {
-      const si = indices[r];
-      const tid = reverseVocabMap ? reverseVocabMap[String(si)] : '?';
-      let word = '?';
-      if (tid !== undefined && tokenizer) {
-        try { word = tokenizer.decode([parseInt(tid, 10)], true); } catch { word = '?'; }
-      }
-      const rank = String(r + 1).padStart(4);
-      const sidx = String(si).padStart(10);
-      const tidStr = String(tid ?? '?').padStart(12);
-      const wStr = word.padStart(16);
-      ilog(`│ ${rank} │ ${sidx} │ ${tidStr} │ ${wStr} │`);
-    }
-    ilog("└──────┴────────────┴──────────────┴──────────────────┘");
   } catch (err) {
     ilog(`❌ Error: ${err.message}`, "fail");
     console.error(err);

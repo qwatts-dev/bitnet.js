@@ -1,6 +1,6 @@
 {
   "name": "bitnet-webgpu-poc",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "An experimental proof-of-concept aimed at running 1-bit AI models (like Microsoft's BitNet b1.58) natively in JavaScript using WebGPU.",
   "main": "bitnet-kernel.js",
   "scripts": {
