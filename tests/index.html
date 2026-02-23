@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <base href="../" />
+  <title>bitnet.js – Hardware Validation &amp; Benchmarks</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: "SF Mono", "Menlo", "Consolas", monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      margin: 0;
+      padding: 1.5rem;
+    }
+    h1 { color: #58a6ff; font-size: 1.25rem; margin-bottom: 0.25rem; }
+    h2 { color: #8b949e; font-size: 0.9rem; font-weight: normal; margin-top: 0; }
+    #output {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      font-size: 0.85rem;
+      max-width: 900px;
+      max-height: 85vh;
+      overflow-y: auto;
+    }
+    .pass  { color: #3fb950; }
+    .fail  { color: #f85149; }
+    .info  { color: #8b949e; }
+    .bold  { font-weight: bold; }
+
+    /* ── Interactive panel ── */
+    #interactive {
+      max-width: 900px;
+      margin-bottom: 1.25rem;
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    #user-text {
+      flex: 1;
+      padding: 0.5rem 0.75rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+      background: #161b22;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      outline: none;
+    }
+    #user-text:focus { border-color: #58a6ff; }
+    #compute-btn {
+      padding: 0.5rem 1rem;
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #fff;
+      background: #238636;
+      border: 1px solid #2ea043;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    #compute-btn:hover { background: #2ea043; }
+    #compute-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    #interactive-output {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      font-size: 0.85rem;
+      max-width: 900px;
+      margin-bottom: 1.25rem;
+      display: none;            /* shown after first compute */
+    }
+  </style>
+</head>
+<body>
+  <h1>bitnet.js – Hardware Validation &amp; Benchmarks</h1>
+  <h2>Bit-Packed · Branchless · Tiled — Automated GPU Math Verification</h2>
+
+  <!-- Interactive compute panel -->
+  <div id="interactive">
+    <input id="user-text" type="text" placeholder="Type a prompt…" disabled />
+    <button id="compute-btn" disabled>Generate</button>
+  </div>
+  <div id="interactive-output"></div>
+
+  <!-- Automated test log -->
+  <div id="output">Initialising WebGPU…</div>
+  <script type="module" src="bitnet.js"></script>
+</body>
+</html>

@@ -5,96 +5,231 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>bitnet.js – BitNet b1.58 WebGPU Inference Engine</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; }
-    body {
-      font-family: "SF Mono", "Menlo", "Consolas", monospace;
-      background: #0d1117;
-      color: #c9d1d9;
-      margin: 0;
-      padding: 1.5rem;
-    }
-    h1 { color: #58a6ff; font-size: 1.25rem; margin-bottom: 0.25rem; }
-    h2 { color: #8b949e; font-size: 0.9rem; font-weight: normal; margin-top: 0; }
-    #output {
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 8px;
-      padding: 1rem 1.25rem;
-      white-space: pre-wrap;
-      line-height: 1.6;
-      font-size: 0.85rem;
-      max-width: 900px;
-      max-height: 85vh;
-      overflow-y: auto;
-    }
-    .pass  { color: #3fb950; }
-    .fail  { color: #f85149; }
-    .info  { color: #8b949e; }
-    .bold  { font-weight: bold; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-    /* ── Interactive panel ── */
-    #interactive {
-      max-width: 900px;
-      margin-bottom: 1.25rem;
-      display: flex;
-      gap: 0.5rem;
-      align-items: center;
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --border:      #30363d;
+      --text:        #c9d1d9;
+      --text-muted:  #8b949e;
+      --accent:      #58a6ff;
+      --green:       #238636;
+      --font:        "SF Mono", "Menlo", "Consolas", monospace;
     }
-    #user-text {
-      flex: 1;
-      padding: 0.5rem 0.75rem;
-      font-family: inherit;
-      font-size: 0.85rem;
-      background: #161b22;
-      color: #c9d1d9;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      outline: none;
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      padding: 2.5rem 1.5rem;
+      line-height: 1.7;
+      max-width: 800px;
+      margin: 0 auto;
     }
-    #user-text:focus { border-color: #58a6ff; }
-    #compute-btn {
-      padding: 0.5rem 1rem;
-      font-family: inherit;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: #fff;
-      background: #238636;
-      border: 1px solid #2ea043;
-      border-radius: 6px;
-      cursor: pointer;
+
+    h1 {
+      font-size: 2rem;
+      color: var(--accent);
+      margin-bottom: 0.25rem;
     }
-    #compute-btn:hover { background: #2ea043; }
-    #compute-btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
+    .tagline {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
     }
-    #interactive-output {
-      background: #161b22;
-      border: 1px solid #30363d;
+
+    h2 {
+      font-size: 1.1rem;
+      color: var(--accent);
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 0.4rem;
+    }
+
+    p, li { font-size: 0.85rem; }
+    p { margin-bottom: 0.75rem; }
+
+    ul {
+      list-style: none;
+      margin-bottom: 1rem;
+    }
+    ul li::before {
+      content: "→ ";
+      color: var(--accent);
+    }
+    ul li { margin-bottom: 0.35rem; }
+
+    code {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.15rem 0.4rem;
+      font-size: 0.8rem;
+    }
+
+    pre {
+      background: var(--surface);
+      border: 1px solid var(--border);
       border-radius: 8px;
       padding: 1rem 1.25rem;
-      white-space: pre-wrap;
+      overflow-x: auto;
+      font-size: 0.8rem;
       line-height: 1.6;
-      font-size: 0.85rem;
-      max-width: 900px;
-      margin-bottom: 1.25rem;
-      display: none;            /* shown after first compute */
+      margin-bottom: 1rem;
+    }
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+      transition: border-color 0.2s;
+    }
+    .card:hover { border-color: var(--accent); }
+    .card h3 {
+      font-size: 0.9rem;
+      margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+    .card p {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 0;
+    }
+
+    .badge {
+      display: inline-block;
+      background: var(--green);
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      vertical-align: middle;
+      margin-left: 0.5rem;
+    }
+
+    footer {
+      margin-top: 3rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .card h3 svg.feather {
+      width: 14px;
+      height: 14px;
+      vertical-align: -1px;
+      margin-right: 0.35rem;
+      stroke: var(--accent);
     }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/feather-icons/dist/feather.min.js"></script>
 </head>
 <body>
-  <h1>bitnet.js</h1>
-  <h2>Bit-Packed · Branchless · Tiled — Auto-Regressive Text Generation (Layer 0)</h2>
 
-  <!-- Interactive compute panel -->
-  <div id="interactive">
-    <input id="user-text" type="text" placeholder="Type a prompt…" disabled />
-    <button id="compute-btn" disabled>Generate</button>
+  <h1>bitnet.js <span class="badge">v0.12.0</span></h1>
+  <p class="tagline">
+    1.58-bit LLM inference in the browser — pure WebGPU, zero server.
+    <br>Bit-Packed · Branchless · Tiled — for Microsoft's BitNet b1.58-2B-4T.
+  </p>
+
+  <h2>Quick Start</h2>
+  <pre><code>&lt;script type="module"&gt;
+  import { BitNetEngine } from './bitnet.js';
+
+  const engine = new BitNetEngine();
+  await engine.init();
+
+  // Chat-style API (Llama 3 template)
+  const result = await engine.chat([
+    { role: 'system', content: 'You are a helpful AI.' },
+    { role: 'user',   content: 'What is WebGPU?' },
+  ], {
+    onToken: (t) =&gt; document.body.append(t),
+    maxTokens: 50,
+  });
+
+  // Or raw prompt generation
+  await engine.generate("Once upon a time", console.log, 20);
+&lt;/script&gt;</code></pre>
+
+  <h2>Examples</h2>
+  <div class="card-grid">
+    <a href="examples/chat/" class="card" style="text-decoration: none;">
+      <h3><i data-feather="message-circle"></i> Chat Demo</h3>
+      <p>Interactive multi-turn chat using <code>engine.chat()</code> with streaming tokens.</p>
+    </a>
+    <div class="card">
+      <h3><i data-feather="zap"></i> Raw Generation</h3>
+      <p>Use <code>engine.generate(prompt)</code> for direct text completion without chat formatting.</p>
+    </div>
+    <a href="tests/" class="card" style="text-decoration: none;">
+      <h3><i data-feather="cpu"></i> Hardware Validation</h3>
+      <p>3 automated GPU tests — 1D kernel, 2D tiled mat-vec, real AI weight forward pass — plus interactive generation.</p>
+    </a>
   </div>
-  <div id="interactive-output"></div>
 
-  <!-- Automated test log -->
-  <div id="output">Initialising WebGPU…</div>
-  <script type="module" src="bitnet.js"></script>
+  <h2>API</h2>
+
+  <p><strong><code>new BitNetEngine()</code></strong> — Create an engine instance.</p>
+
+  <p><strong><code>engine.init(weightsPath?)</code></strong> — Load tokenizer, embeddings, LM head, all 30 transformer layers, and allocate KV cache.</p>
+
+  <p><strong><code>engine.chat(messages, options?)</code></strong> — Chat-template generation. Accepts an array of <code>{ role, content }</code> messages. Options: <code>onToken</code>, <code>maxTokens</code>.</p>
+
+  <p><strong><code>engine.generate(prompt, onToken?, maxTokens?)</code></strong> — Raw prompt generation. You format the prompt string yourself.</p>
+
+  <p><strong><code>engine.reset()</code></strong> — Clear the KV cache to start a new conversation.</p>
+
+  <h2>Architecture</h2>
+  <ul>
+    <li>30-layer transformer with Grouped-Query Attention (GQA 4:1)</li>
+    <li>Ternary weights packed 16-per-u32 (2 bits each) — 1.58-bit precision</li>
+    <li>Branchless bitwise arithmetic — zero warp divergence</li>
+    <li>W1.58A8 activation quantization — INT8 activations, integer dot products</li>
+    <li>RoPE positional encoding (θ = 500,000)</li>
+    <li>SwiGLU MLP with ReLU² gating</li>
+    <li>RMSNorm at every layer boundary</li>
+  </ul>
+
+  <h2>Setup</h2>
+  <pre><code># 1. Clone &amp; install Python deps
+git clone https://github.com/user/bitnet-webgpu-poc.git
+cd bitnet-webgpu-poc
+python -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install torch safetensors huggingface_hub numpy
+
+# 2. Extract model weights (~80 MB per asset)
+python scripts/setup_model.py
+
+# 3. Serve locally
+npx serve . -l 8080</code></pre>
+
+  <footer>
+    MIT License · Built on Microsoft's <a href="https://huggingface.co/microsoft/bitnet-b1.58-2B-4T">BitNet b1.58-2B-4T</a>
+  </footer>
+
+  <script>feather.replace();</script>
 </body>
 </html>
