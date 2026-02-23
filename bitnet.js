@@ -1,5 +1,5 @@
 /**
- * bitnet.js  –  v0.11.1
+ * bitnet.js  –  v0.12.0
  *
  * BitNet b1.58-2B-4T WebGPU inference engine with:
  *
@@ -22,6 +22,9 @@
  *      to i8 in workgroup shared memory, dot products use pure
  *      integer arithmetic, and results are dequantized to f32.
  *
+ *   6. Chat Template API – Llama 3 chat template formatter with
+ *      a standard messages-array interface for conversational AI.
+ *
  * Weight encoding (2 bits per weight):
  *   0b00  →  0   (skip)
  *   0b01  → +1   (add input)
@@ -37,11 +40,15 @@
  *   neg_val  = bitcast<f32>(bitcast<u32>(inp) & mask_neg)
  *   result   = pos_val − neg_val
  *
- * API (v0.11.1 – Object-Oriented)
- * ────────────────────────────────
+ * API (v0.12.0 – Object-Oriented + Chat Template)
+ * ────────────────────────────────────────────────
  *   const engine = new BitNetEngine();
  *   await engine.init();                           // load weights & WebGPU
- *   await engine.generate("Hello!", onToken, 20);  // auto-regressive gen
+ *   await engine.generate("Hello!", onToken, 20);  // raw prompt generation
+ *   await engine.chat([                            // chat-template generation
+ *     { role: 'system', content: 'You are a helpful AI.' },
+ *     { role: 'user',   content: 'Hello!' },
+ *   ], { onToken, maxTokens: 50 });
  *   engine.reset();                                // clear KV cache
  *
  * Usage
@@ -65,7 +72,7 @@ const MLP_DIM       = 6912;   // intermediate_size (SwiGLU)
 const REAL_M        = 2560;   // rows  (down_proj output dim) — kept for Test 3
 const REAL_K        = 6912;   // cols  (down_proj input  dim) — kept for Test 3
 const EMBED_DIM     = 2560;   // hidden_size of bitnet-b1.58-2B-4T
-const LM_HEAD_ROWS  = 16385;  // vocab-sliced rows (16384 + 1 for "WebGPU")
+const LM_HEAD_ROWS  = 16395;  // vocab-sliced rows (16384 + 11 extra tokens)
 const NUM_LAYERS    = 30;     // transformer layers
 
 // ── Self-Attention architecture constants ──
@@ -75,11 +82,21 @@ const HEAD_DIM       = 128;          // dimension per head
 const GQA_GROUP_SIZE = NUM_Q_HEADS / NUM_KV_HEADS;  // 4
 const Q_DIM          = NUM_Q_HEADS  * HEAD_DIM;      // 2560
 const KV_DIM         = NUM_KV_HEADS * HEAD_DIM;      // 640
-const MAX_SEQ_LEN    = 128;          // max tokens in KV cache
+const MAX_SEQ_LEN    = 1024;         // max tokens in KV cache
 const ROPE_THETA     = 500000.0;     // RoPE base frequency
 
+// ── Llama 3 Special Token IDs (Chat Template) ──
+const SPECIAL_TOKENS = {
+  BOS:              128000,  // <|begin_of_text|>
+  EOS:              128001,  // <|end_of_text|>
+  START_HEADER_ID:  128006,  // <|start_header_id|>
+  END_HEADER_ID:    128007,  // <|end_header_id|>
+  EOM_ID:           128008,  // <|eom_id|>
+  EOT_ID:           128009,  // <|eot_id|>
+};
+
 // EOS token IDs for Llama 3
-const EOS_TOKENS = new Set([128001, 128009]);
+const EOS_TOKENS = new Set([SPECIAL_TOKENS.EOS, SPECIAL_TOKENS.EOT_ID]);
 
 const WORKGROUP_SIZE   = 64;
 const TILE_K           = 256;   // tile width for 2D kernel
@@ -400,12 +417,13 @@ fn main(
     workgroupBarrier();
   }
 
-  // Softmax: find max
-  if (tid < params.seq_len) {
-    temp[tid] = scores[tid];
-  } else {
-    temp[tid] = -3.402823e+38;
+  // ── Phase 2: Softmax over scores[0 .. seq_len-1] ──
+  // 2a: Find max (numerical stability) via strided loop
+  var local_max: f32 = -3.402823e+38;
+  for (var p: u32 = tid; p < params.seq_len; p = p + WG_ATTN) {
+    local_max = max(local_max, scores[p]);
   }
+  temp[tid] = local_max;
   workgroupBarrier();
 
   for (var s: u32 = WG_ATTN / 2u; s > 0u; s = s >> 1u) {
@@ -417,13 +435,14 @@ fn main(
   let max_score = temp[0];
   workgroupBarrier();
 
-  // exp(score - max) and sum
-  if (tid < params.seq_len) {
-    temp[tid] = exp(scores[tid] - max_score);
-    scores[tid] = temp[tid];
-  } else {
-    temp[tid] = 0.0;
+  // 2b: exp(score - max) and sum via strided loop
+  var local_sum: f32 = 0.0;
+  for (var p: u32 = tid; p < params.seq_len; p = p + WG_ATTN) {
+    let e = exp(scores[p] - max_score);
+    scores[p] = e;
+    local_sum = local_sum + e;
   }
+  temp[tid] = local_sum;
   workgroupBarrier();
 
   for (var s: u32 = WG_ATTN / 2u; s > 0u; s = s >> 1u) {
@@ -435,9 +454,9 @@ fn main(
   let sum_exp = temp[0];
   workgroupBarrier();
 
-  // Normalize
-  if (tid < params.seq_len) {
-    scores[tid] = scores[tid] / sum_exp;
+  // 2c: Normalize via strided loop
+  for (var p: u32 = tid; p < params.seq_len; p = p + WG_ATTN) {
+    scores[p] = scores[p] / sum_exp;
   }
   workgroupBarrier();
 
@@ -1823,9 +1842,175 @@ export class BitNetEngine {
     this.seqPos = 0;
   }
 
+  /**
+   * Chat-style generation using standard message arrays.
+   *
+   * Automatically applies the Llama 3 chat template to format messages,
+   * then runs auto-regressive generation.
+   *
+   * @param {Array<{role: string, content: string}>} messages
+   *   Array of message objects. Supported roles: 'system', 'user', 'assistant'.
+   *   Example:
+   *     [
+   *       { role: 'system',    content: 'You are a helpful AI.' },
+   *       { role: 'user',      content: 'Hello!' },
+   *     ]
+   *
+   * @param {object}   [options]           – generation options
+   * @param {function} [options.onToken]   – callback(tokenStr, stats) for streaming
+   * @param {number}   [options.maxTokens] – max NEW tokens to generate (default 50)
+   * @param {number}   [options.temperature] – sampling temperature (default 1.0)
+   * @param {number}   [options.topK]      – top-K sampling (default 50)
+   * @param {number}   [options.topP]      – nucleus sampling threshold (default 0.9)
+   * @returns {Promise<{text: string, tokens: number, totalMs: number, prompt: string}>}
+   */
+  async chat(messages, options = {}) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      throw new Error('chat() requires a non-empty array of messages.');
+    }
+
+    const {
+      onToken            = null,
+      maxTokens          = 50,
+      temperature        = 0.7,
+      topK               = 50,
+      topP               = 0.9,
+      repetitionPenalty  = 1.2,
+    } = options;
+
+    // Apply Llama 3 chat template to get the token ID sequence
+    const tokenIds = this._applyLlama3ChatTemplate(messages);
+
+    // Reset KV cache for new sequence
+    this.seqPos = 0;
+
+    const t0 = performance.now();
+    let generatedText  = '';
+    let generatedCount = 0;
+    let lastLogits     = null;
+
+    // ── Phase 1: Prefill (process all template tokens) ──
+    for (let i = 0; i < tokenIds.length; i++) {
+      const { logits } = await this._forward(tokenIds[i]);
+      lastLogits = logits;
+    }
+
+    // ── Phase 2: Decode ──
+    const generatedHistory = new Map();
+
+    while (generatedCount < maxTokens) {
+      const sparseIdx = this._sampleToken(lastLogits, temperature, topK, topP, generatedHistory, repetitionPenalty);
+      generatedHistory.set(sparseIdx, (generatedHistory.get(sparseIdx) || 0) + 1);
+
+      const origId = this.reverseVocabMap
+        ? parseInt(this.reverseVocabMap[String(sparseIdx)] ?? '-1', 10)
+        : -1;
+
+      // Check EOS
+      if (EOS_TOKENS.has(origId)) break;
+
+      // Decode and accumulate
+      const tokenStr = this._decodeToken(sparseIdx);
+      generatedText += tokenStr;
+      generatedCount++;
+
+      // Stream callback
+      if (onToken) {
+        onToken(tokenStr, {
+          tokenNum: generatedCount,
+          tokenId: origId,
+          sparseIdx,
+          logit: lastLogits[sparseIdx],
+        });
+      }
+
+      // Guard against exceeding KV cache
+      if (this.seqPos >= MAX_SEQ_LEN - 1) break;
+
+      // Forward pass for the newly generated token
+      const result = await this._forward(origId);
+      lastLogits = result.logits;
+    }
+
+    const totalMs = performance.now() - t0;
+    return {
+      text:   generatedText,
+      tokens: generatedCount,
+      totalMs,
+      promptTokens: tokenIds.length,
+    };
+  }
+
   // ════════════════════════════════════════════════
   // Private Methods
   // ════════════════════════════════════════════════
+
+  /**
+   * Apply the Llama 3 chat template to a message array.
+   *
+   * Produces a flat array of token IDs:
+   *   <|begin_of_text|>
+   *   <|start_header_id|> system <|end_header_id|> \n\n {content} <|eot_id|>
+   *   <|start_header_id|> user <|end_header_id|> \n\n {content} <|eot_id|>
+   *   <|start_header_id|> assistant <|end_header_id|> \n\n
+   *   (generation starts here)
+   *
+   * @param {Array<{role: string, content: string}>} messages
+   * @returns {number[]} – flat array of token IDs ready for _forward()
+   * @private
+   */
+  _applyLlama3ChatTemplate(messages) {
+    if (!this.tokenizer) throw new Error('Tokenizer not initialised.');
+
+    const tokenIds = [];
+
+    // <|begin_of_text|>
+    tokenIds.push(SPECIAL_TOKENS.BOS);
+
+    for (let i = 0; i < messages.length; i++) {
+      const { role, content } = messages[i];
+      const isLast = (i === messages.length - 1);
+
+      // <|start_header_id|>
+      tokenIds.push(SPECIAL_TOKENS.START_HEADER_ID);
+
+      // Tokenize the role text (e.g. "system", "user", "assistant")
+      const roleIds = Array.from(this.tokenizer.encode(role).ids);
+      tokenIds.push(...roleIds);
+
+      // <|end_header_id|>
+      tokenIds.push(SPECIAL_TOKENS.END_HEADER_ID);
+
+      // \n\n  (two newlines as per Llama 3 template)
+      const nlIds = Array.from(this.tokenizer.encode('\n\n').ids);
+      tokenIds.push(...nlIds);
+
+      // Tokenize the message content
+      const contentIds = Array.from(this.tokenizer.encode(content).ids);
+      tokenIds.push(...contentIds);
+
+      // Close every message with <|eot_id|> EXCEPT the last message
+      // if it's the assistant prompt we want to continue generating
+      if (isLast && role === 'user') {
+        // After the user's last message, close it and open assistant header
+        tokenIds.push(SPECIAL_TOKENS.EOT_ID);
+        tokenIds.push(SPECIAL_TOKENS.START_HEADER_ID);
+        const assistIds = Array.from(this.tokenizer.encode('assistant').ids);
+        tokenIds.push(...assistIds);
+        tokenIds.push(SPECIAL_TOKENS.END_HEADER_ID);
+        const nlIds2 = Array.from(this.tokenizer.encode('\n\n').ids);
+        tokenIds.push(...nlIds2);
+      } else if (isLast && role === 'assistant') {
+        // If last message is assistant (continuation), don't close it —
+        // generation continues from here
+      } else {
+        // All non-last messages get closed with <|eot_id|>
+        tokenIds.push(SPECIAL_TOKENS.EOT_ID);
+      }
+    }
+
+    return tokenIds;
+  }
 
   /**
    * Run one full transformer forward pass for a single token.
@@ -2256,7 +2441,7 @@ async function main() {
   if (el) el.textContent = "";
 
   log("╔════════════════════════════════════════════════════════╗");
-  log("║  bitnet.js – v0.11.1                                   ║");
+  log("║  bitnet.js – v0.12.0                                   ║");
   log("║  BitNet b1.58 · WebGPU · Bit-Packed · Branchless       ║");
   log("╚════════════════════════════════════════════════════════╝");
   log("");

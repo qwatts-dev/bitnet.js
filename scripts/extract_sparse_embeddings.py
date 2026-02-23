@@ -32,7 +32,20 @@ from safetensors.torch import load_file
 
 
 CONTIGUOUS_SLICE = 16384       # first N tokens (frequency-ordered by BPE)
-EXTRA_TOKEN_IDS  = [50991]     # "WebGPU" and any other specific tokens
+EXTRA_TOKEN_IDS  = [
+    50991,   # "WebGPU" – domain-specific test token
+    # ── Llama 3 Chat Template special tokens ──
+    128000,  # <|begin_of_text|>  (BOS)
+    128001,  # <|end_of_text|>    (EOS)
+    128002,  # <|reserved_special_token_0|>
+    128003,  # <|reserved_special_token_1|>
+    128004,  # <|finetune_right_pad_id|>
+    128005,  # <|reserved_special_token_2|>
+    128006,  # <|start_header_id|>
+    128007,  # <|end_header_id|>
+    128008,  # <|eom_id|>         (end of message)
+    128009,  # <|eot_id|>         (end of turn)
+]
 MODEL_NAME       = "microsoft/bitnet-b1.58-2B-4T"
 OUTPUT_DIR       = "weights"
 
