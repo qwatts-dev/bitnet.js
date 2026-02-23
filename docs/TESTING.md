@@ -74,7 +74,7 @@ Compares GPU output against `cpuReferenceMatVec()` — a double-loop with `Math.
 Tests execute automatically when the page loads. No extra setup needed beyond the standard [Quick Start](../README.md#quick-start).
 
 To view results:
-1. Open `http://localhost:8080` in a WebGPU-capable browser
+1. Open `http://localhost:8080/tests/` in a WebGPU-capable browser
 2. Scroll to the test log at the bottom of the page, or open DevTools → Console
 
 All three tests must show **✅ PASS** for the engine to be considered functional.

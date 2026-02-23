@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>bitnet.js – Chat Demo</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --border:      #30363d;
+      --text:        #c9d1d9;
+      --text-muted:  #8b949e;
+      --accent:      #58a6ff;
+      --green:       #238636;
+      --green-hover: #2ea043;
+      --font:        "SF Mono", "Menlo", "Consolas", monospace;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 {
+      font-size: 1rem;
+      color: var(--accent);
+    }
+    header span {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    #status {
+      margin-left: auto;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    #status.ready { color: #3fb950; }
+    #status.error { color: #f85149; }
+
+    /* ── Chat area ── */
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .message {
+      max-width: 720px;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
+    .message.user {
+      align-self: flex-end;
+      background: #1f6feb;
+      color: #fff;
+      border-bottom-right-radius: 2px;
+    }
+
+    .message.assistant {
+      align-self: flex-start;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 2px;
+    }
+
+    .message.system {
+      align-self: center;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      font-style: italic;
+    }
+
+    .message .meta {
+      display: block;
+      margin-top: 0.5rem;
+      font-size: 0.7rem;
+      color: var(--text-muted);
+    }
+
+    /* ── Input bar ── */
+    #input-bar {
+      padding: 1rem 1.5rem;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    #user-input {
+      flex: 1;
+      padding: 0.6rem 0.75rem;
+      font-family: var(--font);
+      font-size: 0.85rem;
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      outline: none;
+      resize: none;
+    }
+    #user-input:focus { border-color: var(--accent); }
+
+    #send-btn {
+      padding: 0.6rem 1.25rem;
+      font-family: var(--font);
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #fff;
+      background: var(--green);
+      border: 1px solid var(--green-hover);
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    #send-btn:hover { background: var(--green-hover); }
+    #send-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>bitnet.js</h1>
+    <span>Chat Demo · BitNet b1.58-2B-4T · WebGPU</span>
+    <div id="status">Loading engine…</div>
+  </header>
+
+  <div id="chat"></div>
+
+  <div id="input-bar">
+    <textarea id="user-input" rows="1" placeholder="Type a message…" disabled></textarea>
+    <button id="send-btn" disabled>Send</button>
+  </div>
+
+  <script type="module">
+    // ── Import bitnet.js from the repo root ──
+    import { BitNetEngine } from '../../bitnet.js';
+
+    // ── DOM refs ──
+    const chatEl   = document.getElementById('chat');
+    const inputEl  = document.getElementById('user-input');
+    const sendBtn  = document.getElementById('send-btn');
+    const statusEl = document.getElementById('status');
+
+    // ── Conversation state ──
+    const SYSTEM_PROMPT = 'You are a helpful, concise AI assistant.';
+    let conversationHistory = [
+      { role: 'system', content: SYSTEM_PROMPT },
+    ];
+
+    // ── Helpers ──
+    function addMessage(role, text, meta = '') {
+      const div = document.createElement('div');
+      div.className = `message ${role}`;
+      div.textContent = text;
+      if (meta) {
+        const span = document.createElement('span');
+        span.className = 'meta';
+        span.textContent = meta;
+        div.appendChild(span);
+      }
+      chatEl.appendChild(div);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      return div;
+    }
+
+    function setUIEnabled(enabled) {
+      inputEl.disabled = !enabled;
+      sendBtn.disabled = !enabled;
+      if (enabled) inputEl.focus();
+    }
+
+    // ── Init engine ──
+    const engine = new BitNetEngine();
+
+    try {
+      // Weights are served from repo root, two levels up
+      await engine.init('../../weights');
+      statusEl.textContent = '● Ready';
+      statusEl.className = 'ready';
+      setUIEnabled(true);
+
+      // Show system prompt
+      addMessage('system', `System: ${SYSTEM_PROMPT}`);
+    } catch (err) {
+      statusEl.textContent = `● Error: ${err.message}`;
+      statusEl.className = 'error';
+      console.error(err);
+    }
+
+    // ── Send handler ──
+    async function handleSend() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      inputEl.value = '';
+      setUIEnabled(false);
+      statusEl.textContent = '● Generating…';
+      statusEl.className = '';
+
+      // Add user message to UI + conversation history
+      addMessage('user', text);
+      conversationHistory.push({ role: 'user', content: text });
+
+      // Create assistant bubble (we'll stream into it)
+      const assistantDiv = addMessage('assistant', '');
+      const streamSpan = document.createElement('span');
+      assistantDiv.appendChild(streamSpan);
+
+      try {
+        const result = await engine.chat(conversationHistory, {
+          maxTokens: 100,
+          temperature: 0.7,
+          onToken(tokenStr) {
+            streamSpan.textContent += tokenStr;
+            chatEl.scrollTop = chatEl.scrollHeight;
+          },
+        });
+
+        // Record assistant reply in conversation history
+        conversationHistory.push({ role: 'assistant', content: result.text });
+
+        // Stats
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        meta.textContent = `${result.tokens} tokens · ${result.totalMs.toFixed(0)}ms · ${result.promptTokens} prompt tokens`;
+        assistantDiv.appendChild(meta);
+
+        statusEl.textContent = '● Ready';
+        statusEl.className = 'ready';
+      } catch (err) {
+        assistantDiv.textContent = `Error: ${err.message}`;
+        statusEl.textContent = '● Error';
+        statusEl.className = 'error';
+        console.error(err);
+      } finally {
+        setUIEnabled(true);
+      }
+    }
+
+    sendBtn.addEventListener('click', handleSend);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !sendBtn.disabled) {
+        e.preventDefault();
+        handleSend();
+      }
+    });
+  </script>
+</body>
+</html>
